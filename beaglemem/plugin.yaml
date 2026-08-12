@@ -1,0 +1,10 @@
+name: beaglemem
+version: 0.1.0
+description: "Deterministic semantic memory learned from conversation history. No API keys, no model downloads, no GPU."
+hooks:
+  - system_prompt_block
+  - prefetch
+  - sync_turn
+  - on_memory_write
+  - on_session_end
+  - shutdown
