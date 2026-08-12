@@ -1,0 +1,8 @@
+beaglemem implements the BEAGLE algorithm from:
+  Jones, M.N. & Mewhort, D.J.K. (2007). Representing word meaning and order
+  information in a composite holographic lexicon. Psychological Review 114(1).
+and builds on Dynamically Structured Holographic Memory:
+  Rutledge-Taylor, M.F., Kelly, M.A., West, R.L., & Pyke, A.A. (2014).
+  Dynamically structured holographic memory. Biologically Inspired Cognitive
+  Architectures 9:9-32.
+Reciprocal Rank Fusion: Cormack, Clarke & Buettcher (2009), SIGIR.
