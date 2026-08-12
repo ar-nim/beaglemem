@@ -1,0 +1,9 @@
+{
+  "semantic_pairs": [["let", "severance", 0.2]],
+  "noise_pairs": [["let", "recipe", 0.08]],
+  "documents": [
+    {"id": 7, "text": "Severance letter signed by hr for the beta division"},
+    {"id": 2, "text": "Recipe for cake: bake flour in the oven slowly"}
+  ],
+  "probe_tests": [{"query": "let go", "must_find": 7, "top_k": 3}]
+}

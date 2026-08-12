@@ -50,3 +50,14 @@ def make_demo_corpus(out_dir: str, seed: int = 42, repeats: int = 40):
             fh.write(json.dumps(row) + "\n")
 
     return corpus_dir, DOCS
+
+
+if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", default=os.path.join(os.path.dirname(__file__), "out"),
+                    help="Output directory (default: examples/out)")
+    args = ap.parse_args()
+    corpus_dir, docs = make_demo_corpus(args.out)
+    print(f"Demo corpus written to {corpus_dir}")
+    print(f"Documents ({len(docs)}) — see make_demo_corpus.DOCS / verify.demo.json")
