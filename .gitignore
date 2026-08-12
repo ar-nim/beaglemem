@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# beaglemem — generated artifacts (plan Task 0.1)
+data/
+verify.local.json
