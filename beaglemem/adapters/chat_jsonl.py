@@ -4,7 +4,7 @@ import glob
 import json
 import os
 
-from beaglemem.corpus import MIN_SENTENCE_WORDS, split_sentences, tokenize
+from ..corpus import MIN_SENTENCE_WORDS, split_sentences, tokenize
 
 KEEP_ROLES = {"user", "assistant"}
 

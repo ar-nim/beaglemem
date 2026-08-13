@@ -44,9 +44,7 @@ def _migrate(args):
     provider) and copies them into beaglemem's own store. Read-only on the
     source; writes only to the destination. Opt-in — beaglemem never assumes
     a holographic store exists."""
-    import sys
-    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from beaglemem.store import BeagleStore
+    from .store import BeagleStore
 
     home = os.path.expanduser("~/.hermes")
     src = args.source or os.path.join(home, "memory_store.db")
@@ -82,12 +80,10 @@ def _migrate(args):
 
 def _build(args):
     """Run the initial full BEAGLE build from configured corpus."""
-    import sys
-    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from beaglemem.vectors import BeagleModel
-    from beaglemem.corpus import iter_sentences
-    from beaglemem.probe import build_doc_vectors
-    from beaglemem.store import BeagleStore
+    from .vectors import BeagleModel
+    from .corpus import iter_sentences
+    from .probe import build_doc_vectors
+    from .store import BeagleStore
     import time
 
     home = os.path.expanduser("~/.hermes")

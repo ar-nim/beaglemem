@@ -15,7 +15,7 @@ df >= 1 for every counted word, so no division-by-zero guard needed.
 """
 import math
 
-from beaglemem.corpus import tokenize
+from .corpus import tokenize
 
 IDF_FLOOR = 1.0   # unknown words: NEUTRAL weight (full contribution, no boost
                   # or penalty). MUST NOT be 0.0 — the semantic bridge depends

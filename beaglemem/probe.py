@@ -7,8 +7,8 @@ IDF (log(N/df)) downweights universal hubs automatically, language-agnostic.
 """
 import numpy as np
 
-from beaglemem.corpus import tokenize
-from beaglemem.idf import build_idf, idf_weight
+from .corpus import tokenize
+from .idf import build_idf, idf_weight
 
 # Function words co-occur with everything, so their mem vectors carry a shared
 # centroid direction that inflates all similarities.

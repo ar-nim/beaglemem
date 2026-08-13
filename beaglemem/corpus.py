@@ -166,11 +166,11 @@ def split_sentences(text: str) -> list[str]:
 def iter_sentences(path: str, format: str = "plain"):
     """Dispatch to the adapter for `format`. Yields tokenized sentences."""
     if format == "plain":
-        from beaglemem.adapters.plain_text import iter_sentences as impl
+        from .adapters.plain_text import iter_sentences as impl
     elif format == "chat-jsonl":
-        from beaglemem.adapters.chat_jsonl import iter_sentences as impl
+        from .adapters.chat_jsonl import iter_sentences as impl
     elif format == "state_db":
-        from beaglemem.adapters.state_db import iter_sentences as impl
+        from .adapters.state_db import iter_sentences as impl
     else:
         raise ValueError(f"unknown corpus format: {format!r}")
     yield from impl(path)

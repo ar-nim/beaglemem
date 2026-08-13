@@ -19,7 +19,7 @@ SELECT is read-only. Never writes to state.db.
 """
 import sqlite3
 
-from beaglemem.corpus import MIN_SENTENCE_WORDS, split_sentences, tokenize
+from ..corpus import MIN_SENTENCE_WORDS, split_sentences, tokenize
 
 KEEP_ROLES = ("user", "assistant")
 

@@ -4,7 +4,7 @@ on_session_end passes a single archive file path, not a directory."""
 import glob
 import os
 
-from beaglemem.corpus import MIN_SENTENCE_WORDS, split_sentences, tokenize
+from ..corpus import MIN_SENTENCE_WORDS, split_sentences, tokenize
 
 _TEXT_GLOBS = ("*.txt", "*.md")
 
