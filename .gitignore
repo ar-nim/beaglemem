@@ -221,3 +221,4 @@ __marimo__/
 data/
 verify.local.json
 scripts/privacy_tokens.txt
+examples/out/
