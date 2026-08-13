@@ -140,3 +140,21 @@ def test_initial_build_stamps_source_and_consumed(tmp_path):
     loaded = BeagleModel.load(str(data_dir))
     assert loaded.corpus_source == "state_db"
     assert loaded.consumed_sentences > 0
+
+
+def test_initial_build_writes_watermark(tmp_path):
+    """_initial_build must stamp last_update.json with the max message id so
+    the next on_session_end does NOT re-read the whole corpus and
+    double-count co-occurrence into the fresh model."""
+    import json
+    data_dir = tmp_path / "beaglemem-data"
+    data_dir.mkdir()
+    _make_big_corpus(str(tmp_path / "state.db"), n=50)
+    p = BeagleMemoryProvider()
+    p.initialize(session_id="test", hermes_home=str(tmp_path))
+    p._initial_build(str(tmp_path / "state.db"), "state_db", str(data_dir), str(data_dir / "beaglemem.db"))
+    stamp_path = os.path.join(str(data_dir), "last_update.json")
+    assert os.path.exists(stamp_path)
+    with open(stamp_path) as fh:
+        stamp = json.load(fh)
+    assert stamp["last_seen_id"] == 50  # max id of the 50-message corpus

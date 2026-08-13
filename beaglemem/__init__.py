@@ -300,6 +300,12 @@ class BeagleMemoryProvider(MemoryProvider):
             self._build_progress = None  # done
             model.corpus_source = "state_db"
             model.save(data_dir)
+            # Stamp the incremental watermark so the next on_session_end does
+            # NOT re-read the whole corpus and double-count co-occurrence into
+            # this freshly built model (id-watermark semantics).
+            from .adapters.state_db import max_message_id
+            with open(os.path.join(data_dir, "last_update.json"), "w") as fh:
+                json.dump({"last_seen_id": max_message_id(corpus_db)}, fh)
             logger.info(f"beaglemem: auto-build complete — {model.size} words from {n} sentences in {time.time()-t0:.0f}s")
 
             # Build fact cache if store has facts
