@@ -24,6 +24,11 @@ def test_render_progress_empty_total():
     assert _render_progress(0, 0) == ""
 
 
+def test_render_progress_complete_clamped():
+    out = _render_progress(120, 100)
+    assert "100%" in out  # clamped, never over 100
+
+
 def test_prefetch_never_injects_progress_bar(tmpdir):
     """Prefetch output must be pure memory context — no progress bar."""
     p = BeagleMemoryProvider()
