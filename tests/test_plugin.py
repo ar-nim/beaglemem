@@ -78,3 +78,29 @@ def test_register_standalone_is_safe():
         register(ctx)
         # In standalone mode register() is a no-op (guard), so provider stays None
         assert ctx.provider is None
+
+
+def test_real_abc_conformance_when_hermes_present():
+    """When Hermes core is importable, beaglemem must satisfy the REAL ABC.
+
+    Python's ABC machinery is the test: instantiating a subclass that fails
+    to implement any @abstractmethod raises TypeError. If this passes, the
+    plugin implements every abstract method the Hermes contract requires.
+    """
+    from beaglemem import _HAS_HERMES
+    if not _HAS_HERMES:
+        import pytest
+        pytest.skip("Hermes core not importable (standalone run)")
+
+    from agent.memory_provider import MemoryProvider
+    from beaglemem import BeagleMemoryProvider
+    # ABC enforcement: abstractmethods must be empty or instantiation raises
+    assert not getattr(BeagleMemoryProvider, "__abstractmethods__", set())
+    p = BeagleMemoryProvider()
+    assert isinstance(p, MemoryProvider)  # genuine ABC subclass
+    # Lifecycle contract smoke: initialize must accept session_id + kwargs
+    import tempfile
+    p.initialize(session_id="abc-test", hermes_home=tempfile.mkdtemp())
+    assert p.is_available() is True
+    assert p.name == "beaglemem"
+    assert callable(p.get_tool_schemas)
