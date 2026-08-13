@@ -121,7 +121,7 @@ class BeagleMemoryProvider(MemoryProvider):
             if self._model.tokenizer_fingerprint not in (None, current_fp):
                 import logging
                 logging.getLogger("beaglemem").warning(
-                    "beaglemem: tokenizer changed — rebuilding from corpus_archive.txt"
+                    "beaglemem: tokenizer changed — rebuilding from state.db"
                 )
                 self._pending_notice = (
                     "⚠️ beaglemem: tokenizer changed — memory vectors are being "
@@ -625,8 +625,8 @@ class BeagleMemoryProvider(MemoryProvider):
         # Fresh install / no vectors yet: FTS5 still works alone.
         # The vector path is additive, never required — same design intent
         # as holographic (hrr_sim=0.5 neutral when hrr_vector missing).
-        # Vectors build automatically from session 1 via sync_turn →
-        # corpus_archive → on_session_end incremental update.
+        # Vectors build automatically from session 1 via the full state.db
+        # auto-build, then on_session_end incremental updates by id watermark.
 
         # If nothing found at all, return empty (but still surface a notice)
         all_ids = set(fts_ids) | set(beagle_ids)
