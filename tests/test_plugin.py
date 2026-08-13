@@ -104,3 +104,51 @@ def test_real_abc_conformance_when_hermes_present():
     assert p.is_available() is True
     assert p.name == "beaglemem"
     assert callable(p.get_tool_schemas)
+
+
+def test_hermes_memory_manager_drives_provider():
+    """INTEGRATION: the real Hermes MemoryManager must be able to drive
+    BeagleMemoryProvider through its full lifecycle.
+
+    This is the authoritative answer to 'what if Hermes changes its contract'.
+    The conformance test proves the plugin LOOKS like the ABC (modes #1:
+    abstract-method drift). This test proves it WORKS when Hermes drives it
+    (modes #2+#3: signature drift, behavioral drift) — because it uses the
+    REAL MemoryManager with its runtime signature introspection
+    (memory_manager.py:_provider_sync_accepts_messages) and REAL dispatch.
+    """
+    from beaglemem import _HAS_HERMES
+    if not _HAS_HERMES:
+        import pytest
+        pytest.skip("Hermes core not importable (standalone run)")
+
+    from agent.memory_manager import MemoryManager
+    from beaglemem import BeagleMemoryProvider
+
+    mgr = MemoryManager()
+    provider = BeagleMemoryProvider()
+    mgr.add_provider(provider)
+
+    # add_provider must have accepted it (one external provider allowed)
+    assert provider in mgr.providers
+
+    # Full lifecycle exactly as Hermes drives it
+    import tempfile
+    mgr.initialize_all(session_id="integration-test", hermes_home=tempfile.mkdtemp())
+    assert provider._initialized is True
+
+    # prefetch: real path (manager passes session_id kwarg)
+    result = mgr.prefetch_all("integration test query", session_id="integration-test")
+    assert isinstance(result, str)  # provider returns str, manager wraps
+
+    # tool schema + dispatch through the REAL routing table
+    schemas = provider.get_tool_schemas()
+    assert any(s["name"] == "beaglemem_search" for s in schemas)
+    dispatch_result = mgr.handle_tool_call("beaglemem_search", {"query": "test"}, session_id="integration-test")
+    assert isinstance(dispatch_result, str)  # JSON string contract via real dispatch
+
+    # sync_turn: manager introspects signature at runtime (mode #2 protection)
+    mgr.sync_all("user turn", "assistant turn", session_id="integration-test")
+
+    # shutdown
+    mgr.shutdown_all()
