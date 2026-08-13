@@ -48,7 +48,14 @@ def test_chat_adapter_single_file(tmp_path):
 
 
 def test_state_db_adapter(tmp_path):
-    """Reads user+assistant text from a Hermes-shaped state.db. Tool rows excluded."""
+    """Reads user+assistant text from a Hermes-shaped state.db.
+
+    - tool rows excluded
+    - [SYSTEM: boilerplate excluded
+    - compaction SUMMARY ([CONTEXT COMPACTION prefix) excluded
+    - active=0, compacted=1 (raw compaction archive) INCLUDED — raw text preserved
+    - active=0, compacted=0 (rewind/undo) excluded
+    """
     import sqlite3
     db = str(tmp_path / "state.db")
     conn = sqlite3.connect(db)
@@ -59,18 +66,21 @@ def test_state_db_adapter(tmp_path):
             role TEXT NOT NULL,
             content TEXT,
             tool_calls TEXT,
-            active INTEGER DEFAULT 1
+            active INTEGER DEFAULT 1,
+            compacted INTEGER DEFAULT 0
         );
-        INSERT INTO messages (session_id, role, content, tool_calls, active) VALUES
-            ('s1', 'user', 'I got laid off from Megacorp. Severance is confirmed.', NULL, 1),
-            ('s1', 'assistant', 'Noted. The termination agreement is signed.', NULL, 1),
-            ('s1', 'assistant', 'Yes! I can check that for you:', '[{"type":"function"}]', 1),
-            ('s1', 'assistant', NULL, '[{"type":"function"}]', 1),
-            ('s1', 'tool', '{"huge": "json dump that should be ignored"}', NULL, 1),
-            ('s2', 'user', '', NULL, 1),
-            ('s2', 'assistant', NULL, NULL, 1),
-            ('s3', 'user', '[SYSTEM: You are running as a scheduled cron job. DELIVERY: ...]', NULL, 1),
-            ('s4', 'user', 'Archived session text should be excluded', NULL, 0);
+        INSERT INTO messages (session_id, role, content, tool_calls, active, compacted) VALUES
+            ('s1', 'user', 'I got laid off from Megacorp. Severance is confirmed.', NULL, 1, 0),
+            ('s1', 'assistant', 'Noted. The termination agreement is signed.', NULL, 1, 0),
+            ('s1', 'assistant', 'Yes! I can check that for you:', '[{"type":"function"}]', 1, 0),
+            ('s1', 'assistant', NULL, '[{"type":"function"}]', 1, 0),
+            ('s1', 'tool', '{"huge": "json dump that should be ignored"}', NULL, 1, 0),
+            ('s2', 'user', '', NULL, 1, 0),
+            ('s2', 'assistant', NULL, NULL, 1, 0),
+            ('s3', 'user', '[SYSTEM: You are running as a scheduled cron job. DELIVERY: ...]', NULL, 1, 0),
+            ('s4', 'user', 'Archived raw session text should be INCLUDED now', NULL, 0, 1),
+            ('s5', 'user', 'Rewind or undo row should stay EXCLUDED', NULL, 0, 0),
+            ('s6', 'assistant', '[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted into this summary.', NULL, 1, 0);
     """)
     conn.commit()
     conn.close()
@@ -83,5 +93,7 @@ def test_state_db_adapter(tmp_path):
     assert "check that for you" in joined              # tool_call WITH prose kept
     assert "json dump" not in joined                   # tool row excluded
     assert "scheduled cron job" not in joined          # [SYSTEM: boilerplate excluded
-    assert "archived session text" not in joined       # active=0 excluded
+    assert "archived raw session text should be included" in joined  # active=0, compacted=1 KEPT
+    assert "rewind or undo row" not in joined          # active=0, compacted=0 excluded
+    assert "compacted into this summary" not in joined # summary excluded
     assert all(len(s) >= 3 for s in sentences)
