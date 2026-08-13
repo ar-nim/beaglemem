@@ -54,6 +54,8 @@ class BeagleModel:
         self.size = 0
         self._capacity = capacity
         self._mem = np.zeros((capacity, dim), dtype=np.float32)
+        self.consumed_sentences = 0   # monotonic: total sentences ever processed
+        self.corpus_source = None      # "state_db" (only value written); None = legacy
 
     def env_of(self, word: str) -> np.ndarray:
         v = self._env_cache.get(word)
@@ -79,6 +81,9 @@ class BeagleModel:
         return idx
 
     def add_sentence(self, words: list[str]) -> None:
+        # History-depth counter first — reflects sentences *seen*, not
+        # sentences *allocated* (min_count pruning below may skip allocation).
+        self.consumed_sentences += 1
         # Track frequency for min_count pruning FIRST. Words below min_count
         # are never allocated — they get a count but no vocab slot or vector.
         # Storage-time pruning (v0.2): a word at count 1 today becomes count 2
@@ -138,6 +143,8 @@ class BeagleModel:
                 "vocab": self.vocab,
                 "counts": self._counts,
                 "tokenizer_fingerprint": getattr(self, "tokenizer_fingerprint", None),
+                "consumed_sentences": getattr(self, "consumed_sentences", 0),
+                "corpus_source": getattr(self, "corpus_source", None),
             }, fh)
 
     @classmethod
@@ -153,6 +160,8 @@ class BeagleModel:
         model.index = {w: i for i, w in enumerate(model.vocab)}
         model._counts = meta.get("counts", {})
         model.tokenizer_fingerprint = meta.get("tokenizer_fingerprint")
+        model.consumed_sentences = meta.get("consumed_sentences", 0)
+        model.corpus_source = meta.get("corpus_source")
         stored = np.load(os.path.join(in_dir, "beagle_mem.npy"))
         model._mem = np.zeros((model._capacity, model.dim), dtype=np.float32)
         model._mem[: stored.shape[0]] = stored

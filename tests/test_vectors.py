@@ -103,3 +103,36 @@ def test_min_count_word_allocated_on_threshold_cross():
     m.add_sentence(["pending", "common", "common", "common"])
     assert "pending" in m.index      # count 2, now allocated
     assert m.mem_of("pending") is not None
+
+
+# --- Phase 2 (corpus-lifecycle refactor): consumed_sentences + corpus_source meta ---
+
+def test_model_meta_roundtrips_consumed_sentences_and_source(tmp_path):
+    from beaglemem.vectors import BeagleModel
+    model = BeagleModel(dim=64, window=2, min_count=1)
+    model.add_sentence(["the", "severance", "letter", "arrived"])
+    model.add_sentence(["the", "severance", "letter", "signed"])
+    model.corpus_source = "state_db"
+    model.save(str(tmp_path))
+    loaded = BeagleModel.load(str(tmp_path))
+    assert loaded.consumed_sentences == 2
+    assert loaded.corpus_source == "state_db"
+
+
+def test_model_meta_defaults_when_absent(tmp_path):
+    """Legacy models (no new keys) load with safe defaults — no crash, no false stale."""
+    from beaglemem.vectors import BeagleModel
+    import json
+    model = BeagleModel(dim=64, window=2, min_count=1)
+    model.add_sentence(["a", "b", "c"])
+    model.save(str(tmp_path))
+    # Simulate a legacy file by stripping the new keys
+    with open(str(tmp_path / "beagle_vocab.json")) as fh:
+        meta = json.load(fh)
+    meta.pop("consumed_sentences", None)
+    meta.pop("corpus_source", None)
+    with open(str(tmp_path / "beagle_vocab.json"), "w") as fh:
+        json.dump(meta, fh)
+    loaded = BeagleModel.load(str(tmp_path))
+    assert loaded.consumed_sentences == 0
+    assert loaded.corpus_source is None
