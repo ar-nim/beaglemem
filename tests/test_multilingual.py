@@ -300,3 +300,60 @@ def test_encode_text_unknown_in_idf_still_contributes():
     m.add_sentence(["meeting", "room", "notes"])
     v = encode_text(m, "meeting", {})  # empty idf → neutral weight
     assert v is not None
+
+
+# --- Cross-lingual semantic bridge (Phase 4) ---
+
+import numpy as np
+from beaglemem.store import MemoryStore
+from beaglemem.probe import probe
+
+# Synthetic EN+PT mixed corpus with planted cross-lingual bridge.
+# "reunião" (PT for "meeting") never co-occurs with English directly,
+# but shares neighbors (scheduled, room, notes) with "meeting" via
+# code-switched sentences.
+PT_EN_SENTENCES = [
+    # Meeting cluster — EN
+    ["meeting", "scheduled", "room", "notes"],
+    ["scheduled", "meeting", "room", "notes"],
+    ["notes", "room", "scheduled", "meeting"],
+    # Meeting cluster — PT (code-switched with shared EN neighbors)
+    ["reunião", "scheduled", "room", "notes"],
+    ["scheduled", "reunião", "room", "notes"],
+    ["notes", "room", "scheduled", "reunião"],
+    # Unrelated cluster (weather)
+    ["weather", "sunny", "weekend", "forecast"],
+    ["sunny", "forecast", "weather", "weekend"],
+] * 20
+
+
+def test_cross_lingual_bridge_en_pt():
+    """'reunião' (PT) and 'meeting' (EN) share neighbors → semantic bridge.
+
+    This is the multilingual proof: BEAGLE learns cross-lingual similarity
+    from shared co-occurrence context, NOT from a dictionary.
+    """
+    from beaglemem.vectors import BeagleModel
+    model = BeagleModel(dim=512, window=2, min_count=2)
+    for s in PT_EN_SENTENCES:
+        model.add_sentence(s)
+
+    assert model.word_cosine("meeting", "reunião") > 0.3
+    assert model.word_cosine("meeting", "weather") < 0.3
+
+
+def test_cross_lingual_probe_en_finds_pt_doc():
+    """Searching 'meeting' should rank a reunião document highly."""
+    from beaglemem.vectors import BeagleModel
+    model = BeagleModel(dim=512, window=2, min_count=2)
+    for s in PT_EN_SENTENCES:
+        model.add_sentence(s)
+
+    store = MemoryStore([
+        {"id": 1, "text": "A reunião foi cancelada hoje"},
+        {"id": 2, "text": "Weather forecast sunny weekend ahead"},
+    ])
+    results = probe(model, "meeting scheduled", store)
+    # Doc 1 (reunião) should rank above doc 2 (weather)
+    assert results[0][0] == 1
+    assert results[0][1] > results[1][1]
