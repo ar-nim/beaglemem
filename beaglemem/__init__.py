@@ -139,6 +139,52 @@ class BeagleMemoryProvider(MemoryProvider):
                     os.remove(stamp)
                 self._force_rebuild = True
 
+        # --- Stub detection (history-depth guard) ---
+        # A model that was recreated from the archive (or is implausibly small
+        # vs the corpus) has lost its history. Detect it and force a rebuild,
+        # exactly like a tokenizer fingerprint mismatch. Ratios are
+        # corpus-agnostic (same-corpus quantities), not tuned to any one store.
+        if self._model is not None:
+            import sqlite3 as _sq
+            try:
+                _conn = _sq.connect(f"file:{corpus_db}?mode=ro", uri=True)
+                _msg_count = _conn.execute(
+                    "SELECT COUNT(*) FROM messages WHERE role IN ('user','assistant') "
+                    "AND content IS NOT NULL AND content != ''"
+                ).fetchone()[0]
+                _conn.close()
+            except Exception:
+                _msg_count = 0
+            _stale = False
+            _reason = ""
+            src = getattr(self._model, "corpus_source", None)
+            consumed = getattr(self._model, "consumed_sentences", 0)
+            if src is not None and src != "state_db" and _msg_count > 100:
+                _stale = True
+                _reason = f"built from non-canonical source '{src}'"
+            elif consumed and _msg_count > 100 and consumed < _msg_count * 0.1:
+                _stale = True
+                _reason = f"consumed only {consumed} sentences vs {_msg_count} messages"
+            elif self._model.size < 100 and _msg_count > 10000:
+                _stale = True
+                _reason = f"vocab {self._model.size} words vs {_msg_count} messages"
+            if _stale:
+                import logging
+                logging.getLogger("beaglemem").warning(
+                    f"beaglemem: suspicious model ({_reason}) — rebuilding from state.db"
+                )
+                self._pending_notice = (
+                    "⚠️ beaglemem: memory vectors appear damaged or incomplete "
+                    f"({_reason}). Rebuilding from session history — search stays "
+                    "FTS5-only until done."
+                )
+                self._model = None
+                self._fact_vectors = None
+                _stamp = os.path.join(self._data_dir, "last_update.json")
+                if os.path.exists(_stamp):
+                    os.remove(_stamp)
+                self._force_rebuild = True
+
         # --- Encoder version check (guards the fact cache only) ---
         # A mismatch means the fact vectors were encoded with a DIFFERENT
         # encoder (IDF formula). Only the fact cache is stale — re-encode.

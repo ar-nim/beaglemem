@@ -79,3 +79,48 @@ def test_tokenizer_change_rebuilds_small_corpus(tmp_path):
     # Model was cleared (mismatch) and a rebuild was scheduled despite <100 msgs
     assert p._model is None
     assert p._initial_build_started is True
+
+
+# --- Phase 5 (corpus-lifecycle refactor): stub detection ---
+
+def _make_stub_model(data_dir: str) -> None:
+    """A tiny model stamped as archive-sourced (the 2026-08-13 stub)."""
+    os.makedirs(data_dir, exist_ok=True)
+    model = BeagleModel(dim=64, window=2, min_count=1)
+    model.add_sentence(["restart", "gateway", "delete"])
+    model.corpus_source = "corpus_archive"
+    model.save(data_dir)
+
+
+def _make_big_corpus(corpus_db: str, n: int = 50) -> None:
+    conn = sqlite3.connect(corpus_db)
+    conn.executescript(
+        "CREATE TABLE IF NOT EXISTS messages "
+        "(id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT, "
+        " content TEXT, active INTEGER DEFAULT 1, compacted INTEGER DEFAULT 0)"
+    )
+    for i in range(n):
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content) VALUES ('s','user',?)",
+            (f"unique topic word {i} about severance and termination",),
+        )
+    conn.commit()
+    conn.close()
+
+
+def test_stub_model_detected_and_flagged(tmp_path):
+    """A model stamped corpus_source=corpus_archive against a real state.db
+    is a stub — it must be cleared + a rebuild notice set."""
+    data_dir = tmp_path / "beaglemem-data"
+    _make_stub_model(str(data_dir))
+    # >100 messages: the source-mismatch branch is gated on _msg_count > 100
+    # (avoid false-flagging tiny fresh corpora) — the corpus must exceed it.
+    _make_big_corpus(str(tmp_path / "state.db"), n=150)
+
+    p = BeagleMemoryProvider()
+    p.initialize(session_id="test", hermes_home=str(tmp_path))
+
+    # Stub cleared so the full auto-build (scheduled) rebuilds from state.db
+    assert p._model is None
+    assert p._pending_notice is not None
+    assert "rebuild" in p._pending_notice.lower()
