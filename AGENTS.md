@@ -9,7 +9,7 @@ must NEVER be committed, even in tests, examples, or commit messages.
 
 ### What counts as a personal token
 
-- **Medications / health data**: e.g. `Vitamin C`, `MEDICATION_NAME`, any drug name
+- **Medications / health data**: e.g. `<MEDICATION_NAME>`, any drug name
   tied to a person, dosage regimens (that is why the test corpus says
   `Vitamin C` instead).
 - **Names / email addresses**: real people's names, personal emails,
@@ -23,12 +23,18 @@ must NEVER be committed, even in tests, examples, or commit messages.
 
 ### Enforced BEFORE first push (the cheap gate)
 
+The banned-token list lives in a **gitignored** file so it can be updated
+without re-leaking the values into the public repo. AGENTS.md itself only
+names token *classes*, never real values.
+
 ```bash
-grep -rIwE "vitamin|HOME_DISTRICT|transjakarta|GOV_SERVICE_ID|INSURANCE_ID|EMPLOYER_BUILDING" \
-  --include="*.py" --include="*.md" --include="*.yaml" --include="*.toml" .
+# tokens live in .gitignore'd scripts/privacy_tokens.txt (one per line)
+# IF that file is missing, list tokens inline with grep -E 'tok1|tok2|...'
+git grep -n -I -E "$(paste -sd'|' scripts/privacy_tokens.txt)" -- . \
+  ':(exclude)AGENTS.md' ':(exclude)scripts/privacy_tokens.txt'
 ```
 
-Add any new token you become aware of to this list. Zero matches = proceed.
+Zero matches = proceed.
 
 ### If a token was already pushed (the expensive gate)
 
@@ -37,25 +43,36 @@ token from the working tree does NOT remove it from history. The token stays
 in the old commits, visible to anyone who clones.
 
 ```bash
-# 1. Build the replacement map: old_token ==> neutral_replacement
+# 1. Build the replacement map: real_token ==> neutral_replacement
+#    (real values come from scripts/privacy_tokens.txt, never hardcoded here)
 cat > /tmp/pii_replacements.txt <<'EOF'
-Vitamin C==>Vitamin C
-vitamin==>vitamin
+REAL_TOKEN_1==>neutral_placeholder_1
+real_token_1==>neutral_placeholder_1
 EOF
 
-# 2. Rewrite ALL history (blobs + commit messages)
+# 2. Rewrite ALL history (blobs only — this does NOT touch commit messages)
 git filter-repo --replace-text /tmp/pii_replacements.txt
 
-# 3. filter-repo deletes origin — re-add it
+# 3. Commit messages need a SEPARATE pass if the token appears in one
+cat > /tmp/pii_messages.txt <<'EOF'
+REAL_TOKEN_1==>neutral_placeholder_1
+EOF
+git filter-repo --replace-message /tmp/pii_messages.txt
+
+# 4. filter-repo deletes origin — re-add it
 git remote add origin git@github.com:ar-nim/beaglemem.git
 
-# 4. Force-push the rewritten history
+# 5. Force-push the rewritten history
 git push --force --all
 git push --force --tags
 
-# 5. VERIFY — this MUST return nothing:
-git log --all -p | grep -iw "vitamin"
+# 6. VERIFY — this MUST return nothing (exclude AGENTS.md + the token list):
+git log --all -p | grep -iwE "REAL_TOKEN_1" --exclude=AGENTS.md --exclude=privacy_tokens.txt
 ```
+
+**Pitfall:** `--replace-text` only rewrites file blobs. If the token appears
+in a commit message (e.g. "scrub `<MEDICATION_NAME>` from test"), run
+`--replace-message` too — otherwise the message keeps the token forever.
 
 **Order matters:** scrub BEFORE pushing anything new. Once a commit is on the
 remote, the token is public forever to anyone who cloned/forked it — rewriting

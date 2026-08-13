@@ -220,3 +220,4 @@ __marimo__/
 # beaglemem — generated artifacts (plan Task 0.1)
 data/
 verify.local.json
+scripts/privacy_tokens.txt
