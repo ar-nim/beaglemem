@@ -15,9 +15,9 @@ must NEVER be committed, even in tests, examples, or commit messages.
 - **Names / email addresses**: real people's names, personal emails,
   nicknames (author identity in `git log` is exempt — it is the account owner).
 - **Places tied to a person**: home address, specific street names, frequented
-  locations (e.g. `HOME_DISTRICT`, `EMPLOYER_BUILDING`).
-- **Services / account IDs**: `GOV_SERVICE_ID`, `INSURANCE_ID`, phone numbers, NIK/KTP/Passport
-  numbers, bank accounts.
+  locations (e.g. `<HOME_DISTRICT>`, `<EMPLOYER_BUILDING>`).
+- **Services / account IDs**: `<GOV_SERVICE_ID>`, `<INSURANCE_ID>`, phone
+  numbers, NIK/KTP/Passport numbers, bank accounts.
 - **Company-internal terms** that could identify the owner's employer or
   medical providers.
 
