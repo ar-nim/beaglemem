@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # FULL SUITE WITH HERMES — the authoritative gate.
+  # Installs hermes-agent (pip) so agent.memory_provider is importable from
+  # site-packages. The conftest's try-import path picks it up automatically.
+  # Runs the REAL-ABC conformance test and the REAL-MemoryManager integration
+  # test. This is the drift detector: if a future Hermes release changes the
+  # ABC or hook signatures, this job fails loudly instead of silently skipping.
+  # ---------------------------------------------------------------------------
+  test-with-hermes:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install test deps + Hermes
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest numpy hermes-agent
+
+      - name: Verify Hermes is importable (this job MUST NOT skip the 2 tests)
+        run: |
+          python -c "import agent.memory_provider; print('agent OK:', agent.memory_provider.__file__)"
+
+      - name: Run full suite
+        run: |
+          python -m pytest -q
+
+      # The two Hermes-dependent tests must RUN, not skip. A skip here means
+      # Hermes wasn't importable → the job is not doing its job.
+      - name: Assert Hermes-dependent tests did not skip
+        run: |
+          python -m pytest tests/test_plugin.py -v -p no:cacheprovider 2>&1 | tee /tmp/plugin_tests.log
+          ! grep -qE "SKIPPED.*(conformance|drives_provider)" /tmp/plugin_tests.log
+
+  # ---------------------------------------------------------------------------
+  # STANDALONE WITHOUT HERMES — the public-contributor gate.
+  # A contributor fork or CI without Hermes must still get a green suite:
+  # 85 tests pass, and the 2 Hermes-dependent tests SKIP with an explicit
+  # reason (never fail, never false-pass). This job documents the skip count
+  # so a regression that breaks standalone mode is caught.
+  # ---------------------------------------------------------------------------
+  test-standalone:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install test deps (NO Hermes)
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest numpy
+
+      - name: Confirm Hermes is NOT importable
+        run: |
+          python -c "import agent" 2>/dev/null && echo "FAIL: agent should not be importable" && exit 1 || echo "OK: agent absent (standalone mode)"
+
+      - name: Run full suite (expect 2 skips)
+        run: |
+          python -m pytest -q -p no:cacheprovider
