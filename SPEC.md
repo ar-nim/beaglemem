@@ -124,33 +124,54 @@
 
 ## Memory-architecture contract (v0.3)
 
-### On-disk layout — ONE sidecar
-- Exactly four artifacts under `beaglemem-data/`:
+### On-disk layout — zero JSON, all metadata in the DB
+- Exactly THREE artifacts under `beaglemem-data/`:
   - `beagle_mem.npy` — corpus word vectors (spec-compliant `.npy`, no custom header keys)
   - `fact_vectors.npy` — fact doc vectors (spec-compliant `.npy`)
-  - `beaglemem.db` — fact store (SQLite FTS5, source facts)
-  - `meta.json` — the single sidecar: ALL non-vector metadata
+  - `beaglemem.db` — SQLite: `facts` + `facts_fts` + `vocab` + `meta` tables
 - `beagle_vocab.json`, `fact_ids.json`, `idf.json`, `last_update.json`,
-  `fact_cache_meta.json` are GONE — folded into `meta.json`.
+  `fact_cache_meta.json` — ALL JSON is GONE. Every non-vector datum lives
+  in `beaglemem.db`.
 
-### Why a sidecar, not a `.npy` header (verified, do not regress)
+### Why not a `.npy` header (verified, do not regress)
 - The `.npy` spec defines the header dict as EXACTLY three keys:
   `descr`, `fortran_order`, `shape`.
 - numpy >= 2.0 enforces it strictly: `EXPECTED_KEYS != d.keys()` → `ValueError`.
 - Confirmed empirically on numpy 2.4.4: `np.load` rejects a header with
   custom keys. Markers therefore CANNOT live in the `.npy` header; they
-  live in the sidecar. (numpy 1.x tolerated extras; 2.x does not.)
+  live in the DB.
 
-### meta.json schema
-- Top-level `config_fingerprint` + two granular guards:
-  - `corpus`: dim, window, min_count, tokenizer_fingerprint, regex,
-    stemmer, vocab, counts, consumed_sentences, corpus_source, last_seen_id
-  - `facts`: encoder_version, ids, idf
+### DB schema (replaces every sidecar)
+- `facts` + `facts_fts` — unchanged (source facts, FTS5).
+- `vocab(idx INTEGER PRIMARY KEY, word TEXT UNIQUE, count INTEGER)` — the
+  corpus vocabulary; `idx` is the row index into `beagle_mem.npy`.
+- `meta(key TEXT PRIMARY KEY, value TEXT)` — key-value rows:
+  `dim`, `window`, `min_count`, `tokenizer_fingerprint`, `regex`,
+  `stemmer`, `encoder_version`, `consumed_sentences`, `corpus_source`,
+  `last_seen_id`.
 - The RAW inputs (`regex`, `stemmer`, `dim`, `window`) are stored BESIDE the
-  hash — this is what makes the fingerprint self-healing (see below).
-- Load-critical for BOTH `.npy` files: vocab order maps `beagle_mem`
-  rows; ids map `fact_vectors` rows. Deleting `meta.json` invalidates
-  both caches coherently (one full rebuild, no torn state).
+  fingerprint hash in `meta` — this is what makes the fingerprint
+  self-healing (see below).
+- NO `fact_ids` on disk: the row→fact mapping is re-derived at load from
+  `SELECT fact_id FROM facts ORDER BY fact_id` and held in memory only.
+- NO `idf` on disk: IDF weights are recomputed on load from the fact store
+  (~ms for thousands of facts); only the `encoder_version` marker persists.
+
+### Fact-row mapping contract (why fact_ids is redundant)
+- `BeagleStore.documents()` MUST be `SELECT ... FROM facts ORDER BY fact_id`
+  (deterministic order — the row↔fact mapping depends on it).
+- Encoding NEVER skips a fact: a fact with no vocab overlap gets a ZERO
+  vector (already filtered by `sims > 0.01` at probe time, so it never
+  surfaces — behaviorally identical to skipping).
+- Invariant: `fact_vectors.npy` rows == `COUNT(*) FROM facts`; row N ↔ the
+  Nth fact by `fact_id` order. The load-time row-count check IS the mapping
+  guarantee.
+
+### Fingerprint in the DB (decision)
+- The fingerprint is a BUILD STAMP: the transaction that writes `vocab` +
+  `meta` (fingerprint, watermark) is the commit of the build. Storing the
+  stamp with the thing it stamps is the coherent choice; the `.npy` header
+  (dim/shape) remains the independent structural anchor.
 
 ### Config contract — config takes top priority
 - `config.yaml` → `plugins.beaglemem` adds: `dim` (2048), `window` (3).
@@ -159,15 +180,15 @@
   are code constants. `tokenizer_fingerprint = sha256(json.dumps({regex,
   stemmer, dim, window}, sort_keys=True))[:16]` mixes BOTH, so a change to
   either side is detected.
-- Config/code is the source of truth. The on-disk sidecar is evidence,
-  not authority: when they disagree, config/code wins.
+- Config/code is the source of truth. The DB is evidence, not authority:
+  when they disagree, config/code wins.
 
 ### Fingerprint semantics — staleness hint, NOT a destroy trigger
 - Two independent signals decide what to do. Only one is hand-editable:
   - INTRINSIC (un-tamperable): `dim` + `shape` from the `.npy` binary
     header (read via `np.lib.format.read_array_header_1_0/2_0` without
     loading the matrix); fact count from `SELECT COUNT(*) FROM facts`.
-  - FINGERPRINT (tamperable): the stored hash + raw inputs in `meta.json`.
+  - FINGERPRINT (tamperable): the stored hash + raw inputs in the DB `meta` table.
 
   | State | Verdict | Action |
   |---|---|---|
@@ -184,7 +205,7 @@
   - hash MATCH → valid, done (fast path).
   - hash MISMATCH → compare stored RAW inputs vs current config/code:
     - all raw inputs match → the hash field was hand-corrupted → recompute
-      the correct hash, write it back to `meta.json`, NO rebuild.
+      the correct hash, write it back to the `meta` table, NO rebuild.
     - any raw input differs → genuine change → rebuild (see decision table).
 - `encoder_version` (fact guard) is a plain string constant; the same
   self-heal logic applies: on mismatch, re-encode facts only (never the corpus).
@@ -192,28 +213,30 @@
 ### Non-destructive rebuild — stage → verify → atomic swap
 - A rebuild NEVER overwrites or deletes existing artifacts in place:
   1. Build the new model fully in memory (do not touch `self._model` yet).
-  2. Write to temp files: `beagle_mem.npy.tmp`, `meta.json.tmp`, etc.
+  2. Write matrices to temp files: `beagle_mem.npy.tmp`, `fact_vectors.npy.tmp`.
   3. `fsync` each temp file.
   4. VERIFY before swap: `beagle_mem.npy` `shape[0] == len(vocab)`;
      vocab non-empty; `fact_vectors.npy` `shape[1] == dim`; fact rows == fact count.
-  5. `os.replace(tmp, final)` for each artifact (atomic on POSIX).
+  5. Commit the DB (vocab + meta in ONE transaction), then
+     `os.replace(tmp, final)` for each `.npy` (atomic on POSIX).
   6. Only then swap `self._model = new_model`.
 - On failure at ANY step (kill, exception, verify fails): the temp files are
   orphaned and the previous artifacts + in-memory model remain intact and
   serving. Vectors are never "gone" — they are replaced only after the
   replacement is proven.
-- The single sidecar makes the metadata commit atomic as ONE unit (vocab +
-  counts + ids + idf + watermark together), closing BOTH the torn-pair
-  window (`.npy` vs `.json`) and the double-count window (`model.save`
-  vs watermark stamp) that existed pre-v0.3.
+- Atomicity: SQLite gives ACID for ALL metadata (facts + vocab + meta) in
+  one transaction; the `.npy` files commit via `os.replace`. The two commit
+  domains (DB vs file) are reconciled by the intrinsic row-count/dim checks,
+  which fire on load and catch any cross-domain mismatch (closes the crash
+  path where `matrix @ q` shape-errors on a dim mismatch).
 - During a SOFT (stale) rebuild, `self._model` keeps serving the old
   vectors. During a HARD (structural) rebuild the old vectors are already
   unusable, so FTS5-only until the swap — but the on-disk files still
   survive a failed rebuild.
-- Intrinsic cross-checks close the crash path where `matrix @ q`
-  shape-errors on a dim mismatch: they fire BEFORE any vector is used.
 
 ### Migration (v0.2 → v0.3)
-- First init after upgrade folds legacy files into `meta.json` once, then
-  removes them. Legacy bare-list `fact_ids.json` re-encodes silently (no
-  notice). Cold start iff no `meta.json` and no legacy files.
+- First init after upgrade folds legacy JSON files (`beagle_vocab.json`,
+  `fact_ids.json`, `idf.json`, `last_update.json`) into the `vocab`/`meta`
+  tables once, then removes them. Legacy bare-list `fact_ids.json`
+  re-encodes silently (no notice). Cold start iff no DB tables and no
+  legacy files.
