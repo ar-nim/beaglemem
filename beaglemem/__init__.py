@@ -53,6 +53,7 @@ class BeagleMemoryProvider(MemoryProvider):
         self._model = None
         self._store = None
         self._fact_vectors = None  # cached (matrix, ids) from disk
+        self._idf = None  # cached IDF weights (idf.json)
         self._initialized = False
         self._sync_thread = None
 
@@ -223,11 +224,15 @@ class BeagleMemoryProvider(MemoryProvider):
                 store = BeagleStore(db_path)
                 docs = store.documents()
                 if docs:
-                    matrix, ids = build_doc_vectors(model, docs)
+                    from .idf import build_idf
+                    idf = build_idf(docs)
+                    with open(os.path.join(data_dir, "idf.json"), "w") as fh:
+                        json.dump(idf, fh)
+                    matrix, ids = build_doc_vectors(model, docs, idf)
                     np.save(os.path.join(data_dir, "fact_vectors.npy"), matrix)
                     with open(os.path.join(data_dir, "fact_ids.json"), "w") as fh:
                         json.dump(ids, fh)
-                    logger.info(f"beaglemem: fact vectors cached — {len(ids)} facts")
+                    logger.info(f"beaglemem: fact vectors cached — {len(ids)} facts (idf v1)")
                 store.close()
         except Exception as e:
             logger.warning(f"beaglemem: auto-build failed (will retry on restart): {e}")
@@ -387,9 +392,11 @@ class BeagleMemoryProvider(MemoryProvider):
         fact_id = self._store.add(content, trust)
         # Update vector cache if model is ready
         if self._model is not None:
-            vec = encode_text(self._model, content)
+            vec = encode_text(self._model, content, self._get_idf())
             if vec is not None:
                 self._append_fact_vector(fact_id, vec)
+        # Facts changed → IDF must be recomputed on next use
+        self._idf = None
         return {"fact_id": fact_id, "stored": True}
 
     def _append_fact_vector(self, fact_id: int, vec) -> None:
@@ -594,9 +601,10 @@ class BeagleMemoryProvider(MemoryProvider):
             try:
                 fact_id = self._store.add(content, trust=0.5)
                 if self._model is not None:
-                    vec = encode_text(self._model, content)
+                    vec = encode_text(self._model, content, self._get_idf())
                     if vec is not None:
                         self._append_fact_vector(fact_id, vec)
+                self._idf = None  # facts changed → recompute on next use
             except Exception:
                 pass  # mirror is best-effort, never breaks the loop
         elif action == "remove" and self._store:
@@ -608,6 +616,7 @@ class BeagleMemoryProvider(MemoryProvider):
                         if doc["text"] == old:
                             self._store.remove(doc["id"])
                             self._drop_fact_vector(doc["id"])
+                            self._idf = None
                             break
             except Exception:
                 pass
@@ -623,9 +632,10 @@ class BeagleMemoryProvider(MemoryProvider):
                             break
                 fact_id = self._store.add(content, trust=0.5)
                 if self._model is not None:
-                    vec = encode_text(self._model, content)
+                    vec = encode_text(self._model, content, self._get_idf())
                     if vec is not None:
                         self._append_fact_vector(fact_id, vec)
+                self._idf = None  # facts changed → recompute on next use
             except Exception:
                 pass
 
@@ -699,12 +709,38 @@ class BeagleMemoryProvider(MemoryProvider):
             pass
         return {}
 
+    def _get_idf(self) -> dict:
+        """Return cached IDF weights, computing + caching from the store if absent.
+
+        IDF is ALWAYS-ON (v0.2): it replaces the STOPWORDS filter. It is
+        computed from the fact store (a "document" = a fact) and invalidated
+        on on_memory_write (facts change df).
+        """
+        if self._idf is not None:
+            return self._idf
+        idf = {}
+        if self._store is not None:
+            try:
+                from .idf import build_idf
+                idf = build_idf(self._store.documents())
+            except Exception:
+                idf = {}
+        self._idf = idf
+        # Cache to disk (idf.json)
+        try:
+            with open(os.path.join(self._data_dir, "idf.json"), "w") as fh:
+                json.dump(idf, fh)
+        except Exception:
+            pass
+        return idf
+
     def _probe_facts(self, query: str, top_k: int = 5):
         """Returns [(fact_id, score, text), ...] — needs fact vectors loaded."""
         if self._fact_vectors is None or self._model is None:
             return []
         matrix, ids = self._fact_vectors
-        q = encode_text(self._model, query)
+        idf = self._get_idf()
+        q = encode_text(self._model, query, idf)
         if q is None or len(ids) == 0:
             return []
         sims = matrix @ q
@@ -735,7 +771,8 @@ class BeagleMemoryProvider(MemoryProvider):
         if self._store is None or self._model is None:
             return
         docs = self._store.documents()
-        matrix, ids = build_doc_vectors(self._model, docs)
+        idf = self._get_idf()
+        matrix, ids = build_doc_vectors(self._model, docs, idf)
         self._fact_vectors = (matrix, ids)
         self._save_fact_cache()
 

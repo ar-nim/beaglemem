@@ -17,14 +17,16 @@ def test_stopwords_present():
 
 
 def test_encode_text_known_words():
-    v = encode_text(_trained_model(), "termination contract")
+    v = encode_text(_trained_model(), "termination contract", {})
     assert v is not None and abs(np.linalg.norm(v) - 1.0) < 1e-4
 
 
 def test_encode_text_unknown_or_stopword_only():
     model = _trained_model()
-    assert encode_text(model, "zzzqqq unknownword") is None
-    assert encode_text(model, "the and of") is None
+    # Unknown words: not in vocab → mem_of None → known=0 → None
+    assert encode_text(model, "zzzqqq unknownword", {}) is None
+    # Stopword-only: not in the synthetic corpus vocab → still None
+    assert encode_text(model, "the and of", {}) is None
 
 
 def test_probe_surfaces_synonym_doc():

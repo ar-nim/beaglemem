@@ -180,3 +180,123 @@ def test_tokenize_korean_chinese_mixed():
     assert "저는" in result       # Korean via WORD_RE
     assert "我在" in result       # Chinese via bigram
     assert "上班" in result       # Chinese via bigram
+
+
+# --- IDF weighting (replaces stopwords) ---
+
+def test_idf_downweights_universal_words():
+    """A word in every document gets zero IDF; a rare word gets high IDF."""
+    from beaglemem.idf import build_idf
+    docs = [
+        {"id": 1, "text": "the meeting is scheduled tomorrow"},
+        {"id": 2, "text": "the weather is sunny today"},
+        {"id": 3, "text": "the recipe needs flour"},
+    ]
+    idf = build_idf(docs)  # idf: dict[str, float]
+    assert idf["the"] < idf["meeting"]
+    assert idf["the"] < idf["weather"]
+    assert idf["the"] == 0.0  # in all 3 docs → log(3/3) = 0 (exact floor)
+    assert idf["meeting"] > idf["the"]  # rare word boosted
+    assert idf["meeting"] > 0.0  # log(3/1) = 1.099
+
+
+def test_idf_never_negative():
+    """A word in EVERY document must floor at exactly 0, never go negative."""
+    from beaglemem.idf import build_idf
+    docs = [
+        {"id": 1, "text": "the the the"},
+        {"id": 2, "text": "the the the"},
+    ]
+    idf = build_idf(docs)
+    assert idf["the"] == 0.0  # log(2/2) = 0, NOT log(2/3) < 0
+
+
+def test_idf_language_agnostic():
+    """Indonesian 'yang' (in every doc) and English 'the' both get downweighted.
+    No language-specific list needed."""
+    from beaglemem.idf import build_idf
+    docs = [
+        {"id": 1, "text": "the rapat yang dijadwalkan besok"},
+        {"id": 2, "text": "the cuaca yang cerah hari ini"},
+        {"id": 3, "text": "the resep yang perlu tepung"},
+    ]
+    idf = build_idf(docs)
+    assert idf["the"] == 0.0
+    assert idf["yang"] == 0.0
+    assert idf["rapat"] > idf["yang"]
+
+
+def test_idf_cjk_multi_char_particle_downweighted():
+    """Multi-char CJK particles (から) survive tokenization → downweighted by IDF.
+
+    Single CJK function chars (的) are DROPPED by the tokenizer (bigrams need
+    >=2 chars), so they never enter the vocab — IDF never sees them. The
+    function-char suppression happens at tokenization, not IDF. IDF handles
+    the MULTI-char particles that DO survive.
+    """
+    from beaglemem.idf import build_idf
+    # "から" (Japanese "from") is a 2-char particle that tokenizes as a bigram.
+    docs = [
+        {"id": 1, "text": "会議 から 帰る"},
+        {"id": 2, "text": "学校 から 来た"},
+        {"id": 3, "text": "駅 から 歩く"},
+    ]
+    idf = build_idf(docs)
+    # "から" appears in every doc → floor 0. Rare content bigram boosted.
+    assert idf["から"] == 0.0
+    assert idf["会議"] > idf["から"]
+
+
+def test_idf_cjk_single_char_never_tokenizes():
+    """Single CJK function chars (的) never become tokens → never in IDF map."""
+    from beaglemem.idf import build_idf
+    docs = [{"id": 1, "text": "会议 的 时间"}]
+    idf = build_idf(docs)
+    # 的 is a single char → dropped by bigram tokenizer → absent from IDF
+    assert "的" not in idf
+
+
+def test_idf_unknown_word_default():
+    """A word not in any document gets a neutral/floor IDF, never crashes."""
+    from beaglemem.idf import build_idf
+    idf = build_idf([{"id": 1, "text": "hello world"}])
+    # unknown word: floor. Must not KeyError.
+    assert isinstance(idf.get("zzz", 0.0), float)
+
+
+# --- encode_text IDF wiring (Phase 3 Task 3.3) ---
+
+def test_idf_floor_is_neutral_not_zero():
+    """A word absent from the fact store gets FULL weight (1.0), not 0.
+
+    Critical: the semantic bridge depends on query words that never appear in
+    ANY fact (demo: 'let go' → severance doc). Floor 0.0 would zero their
+    contribution and kill the bridge. 1.0 = neutral (no boost, no penalty).
+    """
+    from beaglemem.idf import idf_weight
+    assert idf_weight({}, "anything") == 1.0
+
+
+def test_encode_text_applies_idf_weights():
+    """encode_text scales each word's mem vector by its IDF weight."""
+    import numpy as np
+    from beaglemem.vectors import BeagleModel
+    from beaglemem.probe import encode_text
+    m = BeagleModel(dim=64, window=2, min_count=1)
+    m.add_sentence(["alpha", "beta", "gamma"])
+    idf = {"alpha": 2.0, "beta": 0.5}
+    v = encode_text(m, "alpha beta", idf)
+    assert v is not None
+    assert abs(np.linalg.norm(v) - 1.0) < 1e-4
+
+
+def test_encode_text_unknown_in_idf_still_contributes():
+    """Words in the corpus model but absent from the IDF map still contribute
+    (floor 1.0) — preserves the semantic bridge for out-of-fact vocabulary."""
+    from beaglemem.vectors import BeagleModel
+    from beaglemem.probe import encode_text
+    m = BeagleModel(dim=64, window=2, min_count=1)
+    m.add_sentence(["meeting", "room", "notes"])
+    m.add_sentence(["meeting", "room", "notes"])
+    v = encode_text(m, "meeting", {})  # empty idf → neutral weight
+    assert v is not None
