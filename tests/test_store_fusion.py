@@ -114,3 +114,42 @@ def test_fact_ids_ordered(tmp_path):
     c = store.add("z")
     assert store.fact_ids() == [b, c]
     store.close()
+
+
+def test_existing_v02_db_gets_vocab_meta_tables(tmp_path):
+    """BUG REGRESSION: opening an EXISTING v0.2 DB (facts + facts_fts only,
+    no vocab/meta) with create=False must still create the v0.3 tables.
+
+    Before the fix, _init_db() only ran when create=True, so a real
+    pre-v0.3 store (opened normally at initialize) never got vocab/meta.
+    _migrate_legacy_json() then silently skipped (its guard query raised),
+    the load saw a cold store, and every restart forced a full rebuild."""
+    path = str(tmp_path / "beaglemem.db")
+    # Simulate a legacy v0.2 DB: only facts + facts_fts exist.
+    import sqlite3
+    conn = sqlite3.connect(path)
+    conn.executescript("""
+        CREATE TABLE facts (
+            fact_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            content TEXT NOT NULL,
+            trust_score REAL DEFAULT 0.5,
+            created_at TEXT,
+            updated_at TEXT
+        );
+        CREATE VIRTUAL TABLE facts_fts
+            USING fts5(content, content='facts', content_rowid='fact_id');
+    """)
+    conn.execute("INSERT INTO facts (content) VALUES ('legacy fact one')")
+    conn.commit()
+    conn.close()
+
+    # Open WITHOUT create (the normal initialize() path for an existing store).
+    store = BeagleStore(path)
+    tables = {r[0] for r in store._conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "vocab" in tables, "vocab table must be created on existing v0.2 DB"
+    assert "meta" in tables, "meta table must be created on existing v0.2 DB"
+    # The legacy fact is intact and readable.
+    assert len(store.documents()) == 1
+    assert store.documents()[0]["text"] == "legacy fact one"
+    store.close()

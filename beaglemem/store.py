@@ -65,7 +65,13 @@ class BeagleStore:
             self._lock = entry["lock"]
 
         with self._lock:
-            if not entry["ready"] and create:
+            if not entry["ready"]:
+                # ALWAYS ensure the schema exists — not just on create=True.
+                # _init_db is idempotent (IF NOT EXISTS), and running it on an
+                # existing v0.2 store is what makes the v0.3 migration path
+                # work: opening a real pre-v0.3 DB at initialize() must create
+                # the vocab/meta tables or _migrate_legacy_json() silently
+                # skips and every restart forces a needless full rebuild.
                 self._init_db()
                 entry["ready"] = True
 
