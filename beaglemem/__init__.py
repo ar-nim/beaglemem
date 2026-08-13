@@ -89,6 +89,7 @@ class BeagleMemoryProvider(MemoryProvider):
 
         # Resolve corpus source (state.db by default)
         corpus_db = config.get("corpus_dir") or os.path.join(hermes_home, "state.db")
+        self._corpus_db = corpus_db
         fmt = config.get("format", "state_db")
 
         # Load BEAGLE model if built
@@ -712,38 +713,42 @@ class BeagleMemoryProvider(MemoryProvider):
                 pass
 
     def on_session_end(self, messages=None) -> None:
-        """Incremental BEAGLE update from new corpus material.
+        """Incremental BEAGLE update from state.db (id watermark).
 
-        Processes ONLY the appended tail of corpus_archive.txt (byte-offset
-        tracking). Re-reading the whole archive every session would
-        double-count history: session 2 re-adds session 1, session 3 re-adds
-        sessions 1+2 — old content accumulating unboundedly. The offset stamp
-        makes incremental == batch (tested in test_incremental_equals_batch).
+        Reads ONLY messages with id > last_seen_id, then advances the
+        watermark. Re-reading the whole store every session would double-count.
+        The id watermark makes incremental == batch, exactly like the old
+        byte-offset did — but against the canonical store instead of a mirror.
+
+        STUB GUARD: if _model is None, return immediately. Never build a fresh
+        model from a partial tail — that was the 2026-08-13 data-loss bug
+        (a damaged archive tail produced an 80-word "complete" model). The full
+        build path in initialize() owns the model-creation decision.
         """
         if not self._initialized or not self._data_dir:
             return
-        archive = os.path.join(self._data_dir, "corpus_archive.txt")
-        if not os.path.exists(archive):
+        corpus_db = getattr(self, "_corpus_db", None)
+        if not corpus_db or not os.path.exists(corpus_db):
             return
+        if self._model is None:
+            return  # full auto-build owns this; do not manufacture a stub
+        from .adapters.state_db import iter_sentences_since, max_message_id
+
         stamp = os.path.join(self._data_dir, "last_update.json")
-        last_offset = 0
+        last_seen_id = 0
         if os.path.exists(stamp):
-            with open(stamp) as fh:
-                last_offset = json.load(fh).get("offset", 0)
-        size = os.path.getsize(archive)
-        if size <= last_offset:
+            try:
+                with open(stamp) as fh:
+                    last_seen_id = json.load(fh).get("last_seen_id", 0)
+            except Exception:
+                last_seen_id = 0
+        max_id = max_message_id(corpus_db)
+        if max_id <= last_seen_id:
             return
-        model = self._model or BeagleModel()
+        model = self._model
         prev_size = model.size
-        with open(archive, "r", encoding="utf-8") as fh:
-            fh.seek(last_offset)  # ← only new lines since last update
-            for line in fh:
-                for raw in split_sentences(line):
-                    words = tokenize(raw)
-                    if len(words) >= MIN_SENTENCE_WORDS:
-                        model.add_sentence(words)
-        # Vocab growth alarm: a healthy session adds 5-20 new words.
-        # 200+ means a filter failed — base64/code/log leaked into the corpus.
+        for words in iter_sentences_since(corpus_db, last_seen_id):
+            model.add_sentence(words)
         new_words = model.size - prev_size
         if new_words > 200:
             import logging
@@ -752,10 +757,9 @@ class BeagleMemoryProvider(MemoryProvider):
             )
         model.save(self._data_dir)
         self._model = model
-        # Rebuild fact cache from the updated model
         self._rebuild_fact_cache()
         with open(stamp, "w") as fh:
-            json.dump({"offset": size}, fh)
+            json.dump({"last_seen_id": max_id}, fh)
 
     def shutdown(self) -> None:
         self._initialized = False
