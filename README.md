@@ -86,8 +86,21 @@ they hold generated vectors and your private acceptance config.
 ## Hermes memory provider
 
 beaglemem is also a Hermes Agent memory provider plugin — the same package,
-two audiences. Install under `~/.hermes/plugins/beaglemem/`, activate as the
-memory provider, and:
+two audiences. Install under `~/.hermes/plugins/beaglemem/` (user plugin dir),
+activate as the memory provider (`memory.provider: beaglemem` in config.yaml),
+and:
+
+### In-session tools (what the agent calls)
+
+- `beaglemem_add` — store a durable fact (with optional trust score)
+- `beaglemem_search` — fused FTS5 + BEAGLE retrieval, trust-weighted
+- `beaglemem_feedback` — rate a fact helpful/unhelpful (adjusts trust)
+- `beaglemem_status` — on-demand build status: whether the vector model is
+  built, in-progress (with live progress bar + percentage), or pending. Also
+  reports fact-store size and any pending rebuild notice (e.g. after an
+  upgrade that changes the tokenizer).
+
+### CLI (operational)
 
 - `hermes beaglemem status` — model/vocab/fact-cache status
 - `hermes beaglemem config` — show config.yaml plugin section
@@ -95,8 +108,13 @@ memory provider, and:
 - `hermes beaglemem migrate --source ~/.hermes/memory_store.db` — one-time
   read-only copy of facts from holographic's store
 
+### Build + rebuild behavior
+
 Cold start works FTS5-only; vectors auto-build in the background from session
-history on first activation, and incremental updates run at session end.
+history on first activation, and incremental updates run at session end (no
+progress bar — they're small). A **full build** (first run, or a rebuild after
+a tokenizer/encoder upgrade) shows a live progress bar via `beaglemem_status`;
+it is deliberately NOT injected into the conversation context.
 
 ## What this is NOT
 
