@@ -128,6 +128,7 @@ class BeagleModel:
                 "min_count": self.min_count,
                 "vocab": self.vocab,
                 "counts": self._counts,
+                "tokenizer_fingerprint": getattr(self, "tokenizer_fingerprint", None),
             }, fh)
 
     @classmethod
@@ -142,6 +143,7 @@ class BeagleModel:
         model.vocab = meta["vocab"]
         model.index = {w: i for i, w in enumerate(model.vocab)}
         model._counts = meta.get("counts", {})
+        model.tokenizer_fingerprint = meta.get("tokenizer_fingerprint")
         stored = np.load(os.path.join(in_dir, "beagle_mem.npy"))
         model._mem = np.zeros((model._capacity, model.dim), dtype=np.float32)
         model._mem[: stored.shape[0]] = stored

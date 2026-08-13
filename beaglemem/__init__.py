@@ -92,6 +92,51 @@ class BeagleMemoryProvider(MemoryProvider):
                 json.load(open(ids_path)),
             )
 
+        # --- Tokenizer fingerprint check (guards the corpus model) ---
+        # A mismatch means the on-disk model was built with a DIFFERENT
+        # tokenizer (e.g. v0.1 → v0.2 upgrade). Its vectors are stale and must
+        # be rebuilt from the raw corpus archive.
+        from .fingerprint import tokenizer_fingerprint
+        _TOKENIZER_REGEX = r"[^\W_][^\W_'\-=]*"  # v0.2 Unicode word regex
+        if self._model is not None:
+            current_fp = tokenizer_fingerprint(
+                regex=_TOKENIZER_REGEX, stemmer=None,
+                dim=self._model.dim, window=self._model.window,
+            )
+            if self._model.tokenizer_fingerprint not in (None, current_fp):
+                import logging
+                logging.getLogger("beaglemem").warning(
+                    "beaglemem: tokenizer changed — rebuilding from corpus_archive.txt"
+                )
+                # Clear BOTH model and fact cache. The stale fact_vectors.npy
+                # was built against the OLD model — serving it is wrong.
+                # Degrade to FTS5-only until the rebuild completes.
+                self._model = None
+                self._fact_vectors = None
+                stamp = os.path.join(self._data_dir, "last_update.json")
+                if os.path.exists(stamp):
+                    os.remove(stamp)
+                self._force_rebuild = True
+
+        # --- Encoder version check (guards the fact cache only) ---
+        # A mismatch means the fact vectors were encoded with a DIFFERENT
+        # encoder (IDF formula). Only the fact cache is stale — re-encode.
+        from .fingerprint import ENCODER_VERSION
+        fact_meta_path = os.path.join(self._data_dir, "fact_cache_meta.json")
+        stored_enc = None
+        if os.path.exists(fact_meta_path):
+            try:
+                with open(fact_meta_path) as fh:
+                    stored_enc = json.load(fh).get("encoder_version")
+            except Exception:
+                stored_enc = None
+        if stored_enc != ENCODER_VERSION:
+            import logging
+            logging.getLogger("beaglemem").warning(
+                "beaglemem: encoder changed — re-encoding fact cache"
+            )
+            self._fact_vectors = None  # forces _rebuild_fact_cache() on next use
+
         # Connect to the self-owned SQLite store (creates if missing)
         if os.path.exists(db_path):
             try:
@@ -125,7 +170,10 @@ class BeagleMemoryProvider(MemoryProvider):
                     "SELECT COUNT(*) FROM messages WHERE role IN ('user','assistant') AND content IS NOT NULL AND content != ''"
                 ).fetchone()[0]
                 test_conn.close()
-                if msg_count > 100:
+                # A tokenizer change (self._force_rebuild) is MANDATORY — it
+                # must rebuild even on a small corpus. Only the OPPORTUNISTIC
+                # first-run auto-build is gated by msg_count > 100.
+                if getattr(self, "_force_rebuild", False) or msg_count > 100:
                     import logging
                     logging.getLogger("beaglemem").info(
                         f"beaglemem: auto-building vectors from {corpus_db} ({msg_count} messages) in background"
