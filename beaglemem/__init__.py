@@ -41,6 +41,16 @@ except ImportError:
     _HAS_HERMES = False
 
 
+def _render_progress(done: int, total: int, label: str = "Building memory vectors") -> str:
+    """Render an ASCII progress bar. Clamps to 100%, empty if total is 0."""
+    if total <= 0:
+        return ""
+    pct = int(min(100, done / total * 100))
+    filled = pct // 10
+    bar = "█" * filled + "░" * (10 - filled)
+    return f"{label}: [{bar}] {pct}% ({done}/{total})"
+
+
 class BeagleMemoryProvider(MemoryProvider):
     """Self-contained memory provider with BEAGLE semantic retrieval."""
 
@@ -57,6 +67,7 @@ class BeagleMemoryProvider(MemoryProvider):
         self._initialized = False
         self._sync_thread = None
         self._pending_notice = None  # user-visible warning (rebuild events)
+        self._build_progress = None  # (done, total) while a full build runs
 
     # -- required lifecycle -------------------------------------------------
 
@@ -224,10 +235,22 @@ class BeagleMemoryProvider(MemoryProvider):
 
             t0 = time.time()
             model = BeagleModel(dim=2048, window=3)
+
+            # Count total sentences first so we can show a progress bar.
+            # iter_sentences is a generator — count via a cheap first pass.
+            total_sentences = 0
+            for _ in iter_sentences(corpus_db, format=fmt):
+                total_sentences += 1
+
             n = 0
+            self._build_progress = (0, total_sentences) if total_sentences else None
             for words in iter_sentences(corpus_db, format=fmt):
                 model.add_sentence(words)
                 n += 1
+                # Update progress ~every 1% (cheap, avoids lock contention)
+                if total_sentences and n % max(1, total_sentences // 100) == 0:
+                    self._build_progress = (n, total_sentences)
+            self._build_progress = None  # done
             model.save(data_dir)
             logger.info(f"beaglemem: auto-build complete — {model.size} words from {n} sentences in {time.time()-t0:.0f}s")
 
@@ -247,6 +270,7 @@ class BeagleMemoryProvider(MemoryProvider):
                     logger.info(f"beaglemem: fact vectors cached — {len(ids)} facts (idf v1)")
                 store.close()
         except Exception as e:
+            self._build_progress = None
             logger.warning(f"beaglemem: auto-build failed (will retry on restart): {e}")
 
     def get_config_schema(self):
@@ -545,13 +569,22 @@ class BeagleMemoryProvider(MemoryProvider):
         return self._with_notice("Relevant memories (fused FTS5+BEAGLE):\n" + "\n".join(lines))
 
     def _with_notice(self, output: str) -> str:
-        """Prepend a pending user-facing notice (rebuild events) once."""
+        """Prepend a pending user-facing notice (rebuild events) once, and
+        append a live progress bar if a full vector build is running."""
+        parts = []
         if self._pending_notice:
-            notice = self._pending_notice
+            parts.append(self._pending_notice)
             self._pending_notice = None  # show once
+        if self._build_progress is not None:
+            done, total = self._build_progress
+            bar = _render_progress(done, total)
+            if bar:
+                parts.append(bar)
+        if parts:
+            prefix = "\n\n".join(parts)
             if output:
-                return notice + "\n\n" + output
-            return notice
+                return prefix + "\n\n" + output
+            return prefix
         return output
 
     def _prefetch_beagle_only(self, query: str) -> str:
