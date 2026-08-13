@@ -268,7 +268,7 @@ class BeagleMemoryProvider(MemoryProvider):
         user chats normally (FTS5-only) while this runs. On completion, the
         model is saved to disk; the NEXT session's initialize() loads it.
 
-        Failures are logged but swallowed — the flag in last_update.json
+        Failures are logged but swallowed — the watermark in last_update.json
         prevents re-triggering within the same session. A restart will retry.
         """
         import logging
@@ -298,6 +298,7 @@ class BeagleMemoryProvider(MemoryProvider):
                 if total_sentences and n % max(1, total_sentences // 100) == 0:
                     self._build_progress = (n, total_sentences)
             self._build_progress = None  # done
+            model.corpus_source = "state_db"
             model.save(data_dir)
             logger.info(f"beaglemem: auto-build complete — {model.size} words from {n} sentences in {time.time()-t0:.0f}s")
 

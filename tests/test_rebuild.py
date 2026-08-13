@@ -124,3 +124,19 @@ def test_stub_model_detected_and_flagged(tmp_path):
     assert p._model is None
     assert p._pending_notice is not None
     assert "rebuild" in p._pending_notice.lower()
+
+
+# --- Phase 6 (corpus-lifecycle refactor): full-build source stamp ---
+
+def test_initial_build_stamps_source_and_consumed(tmp_path):
+    """A full build from state.db must stamp corpus_source='state_db' and a
+    consumed_sentences > 0, so a later load is not false-flagged as a stub."""
+    data_dir = tmp_path / "beaglemem-data"
+    data_dir.mkdir()
+    _make_big_corpus(str(tmp_path / "state.db"), n=50)
+    p = BeagleMemoryProvider()
+    p.initialize(session_id="test", hermes_home=str(tmp_path))
+    p._initial_build(str(tmp_path / "state.db"), "state_db", str(data_dir), str(data_dir / "beaglemem.db"))
+    loaded = BeagleModel.load(str(data_dir))
+    assert loaded.corpus_source == "state_db"
+    assert loaded.consumed_sentences > 0

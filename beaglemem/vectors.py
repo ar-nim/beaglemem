@@ -55,7 +55,7 @@ class BeagleModel:
         self._capacity = capacity
         self._mem = np.zeros((capacity, dim), dtype=np.float32)
         self.consumed_sentences = 0   # monotonic: total sentences ever processed
-        self.corpus_source = None      # "state_db" (only value written); None = legacy
+        self.corpus_source: str | None = None  # "state_db" (only value written); None = legacy
 
     def env_of(self, word: str) -> np.ndarray:
         v = self._env_cache.get(word)
