@@ -3,8 +3,18 @@ import json
 import os
 
 
+def _hermes_home() -> str:
+    """Profile-aware Hermes home. Hermes sets HERMES_HOME to the active
+    profile's directory (~/.hermes/profiles/<name> for named profiles,
+    ~/.hermes for default); the runtime provider receives it via
+    memory_manager.initialize_all(). The CLI must resolve the SAME home or
+    `hermes -p <profile> beaglemem <cmd>` operates on the wrong profile's
+    data. Never hardcode ~/.hermes."""
+    return os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
+
+
 def _status(args):
-    home = os.path.expanduser("~/.hermes")
+    home = _hermes_home()
     db_path = os.path.join(home, "beaglemem-data", "beaglemem.db")
     if os.path.exists(db_path):
         try:
@@ -23,7 +33,7 @@ def _status(args):
 
 
 def _config(args):
-    home = os.path.expanduser("~/.hermes")
+    home = _hermes_home()
     cfg = os.path.join(home, "config.yaml")
     if os.path.exists(cfg):
         try:
@@ -49,7 +59,7 @@ def _migrate(args):
     a holographic store exists."""
     from .store import BeagleStore
 
-    home = os.path.expanduser("~/.hermes")
+    home = _hermes_home()
     src = args.source or os.path.join(home, "memory_store.db")
     if not os.path.exists(src):
         print(f"No source store at {src} — nothing to migrate.")
@@ -93,7 +103,7 @@ def _build(args):
     from .adapters.state_db import max_message_id
     import time
 
-    home = os.path.expanduser("~/.hermes")
+    home = _hermes_home()
     data_dir = os.path.join(home, "beaglemem-data")
     os.makedirs(data_dir, exist_ok=True)
     db_path = os.path.join(data_dir, "beaglemem.db")
