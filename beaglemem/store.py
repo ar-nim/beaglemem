@@ -1,5 +1,6 @@
 """Document stores. MemoryStore for demos/tests; BeagleStore is
 self-owned SQLite with FTS5 (create + read + write)."""
+import json
 import sqlite3
 import threading
 from pathlib import Path
@@ -79,6 +80,15 @@ class BeagleStore:
             );
             CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts
                 USING fts5(content, content='facts', content_rowid='fact_id');
+            CREATE TABLE IF NOT EXISTS vocab (
+                idx INTEGER PRIMARY KEY,
+                word TEXT NOT NULL UNIQUE,
+                count INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
         """)
 
     def add(self, content: str, trust: float = 0.5) -> int:
@@ -114,11 +124,22 @@ class BeagleStore:
             )
 
     def documents(self) -> list[dict]:
+        # v0.3 fact-row mapping contract: MUST be deterministic fact_id order —
+        # fact_vectors.npy row N maps to the Nth fact by id.
         with self._lock:
             rows = self._conn.execute(
-                "SELECT fact_id, content FROM facts WHERE content IS NOT NULL"
+                "SELECT fact_id, content FROM facts WHERE content IS NOT NULL "
+                "ORDER BY fact_id"
             ).fetchall()
         return [{"id": r["fact_id"], "text": r["content"]} for r in rows]
+
+    def fact_ids(self) -> list[int]:
+        """Fact ids in canonical row order (the in-memory row↔fact map)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT fact_id FROM facts ORDER BY fact_id"
+            ).fetchall()
+        return [r[0] for r in rows]
 
     def fts_search(self, query: str, limit: int = 20) -> list[int]:
         try:
@@ -138,6 +159,71 @@ class BeagleStore:
                 "SELECT trust_score FROM facts WHERE fact_id = ?", (fact_id,)
             ).fetchone()
         return float(row[0]) if row and row[0] is not None else 0.5
+
+    # -- v0.3: meta key-value table (build stamps, fingerprint, watermark) ---
+
+    def set_meta(self, key: str, value) -> None:
+        """Upsert a JSON-serializable meta value."""
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO meta (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, json.dumps(value)),
+            )
+
+    def get_meta(self, key: str, default=None):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM meta WHERE key = ?", (key,)
+            ).fetchone()
+        if row is None:
+            return default
+        try:
+            return json.loads(row[0])
+        except Exception:
+            return default
+
+    def all_meta(self) -> dict:
+        with self._lock:
+            rows = self._conn.execute("SELECT key, value FROM meta").fetchall()
+        out = {}
+        for key, value in rows:
+            try:
+                out[key] = json.loads(value)
+            except Exception:
+                out[key] = value
+        return out
+
+    # -- v0.3: vocab table (idx is the beagle_mem.npy row index) ------------
+
+    def replace_vocab(self, words: list[str], counts: dict) -> None:
+        """Atomically replace the whole vocabulary (one transaction)."""
+        rows = [(i, w, int(counts.get(w, 0))) for i, w in enumerate(words)]
+        with self._lock:
+            self._conn.execute("BEGIN")
+            try:
+                self._conn.execute("DELETE FROM vocab")
+                self._conn.executemany(
+                    "INSERT INTO vocab (idx, word, count) VALUES (?, ?, ?)", rows
+                )
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+
+    def vocab_words(self) -> list[str]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT word FROM vocab ORDER BY idx"
+            ).fetchall()
+        return [r[0] for r in rows]
+
+    def vocab_rows(self) -> list[tuple]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT idx, word, count FROM vocab ORDER BY idx"
+            ).fetchall()
+        return [(r[0], r[1], r[2]) for r in rows]
 
     def close(self) -> None:
         with BeagleStore._shared_guard:

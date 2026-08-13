@@ -55,3 +55,62 @@ def test_rrf_two_lists_boost_shared():
 def test_rrf_score_math():
     fused = rrf([[7]], k=60)
     assert abs(fused[0][1] - (1.0 / 61.0)) < 1e-9
+
+
+# --- Phase 1 (v0.3): vocab + meta tables, deterministic ordering ---
+
+def test_documents_ordered_by_fact_id(tmp_path):
+    """documents() MUST return facts in fact_id order (v0.3 fact-row mapping
+    contract: row N ↔ Nth fact by id). Removal must not disturb the order."""
+    path = str(tmp_path / "beaglemem.db")
+    store = BeagleStore(path, create=True)
+    a = store.add("first fact")
+    b = store.add("second fact")
+    c = store.add("third fact")
+    store.remove(b)  # middle removed → remaining must still be [a, c] by id
+    assert [d["id"] for d in store.documents()] == [a, c]
+    store.close()
+
+
+def test_meta_round_trip(tmp_path):
+    """meta key-value table round-trips JSON-serializable values."""
+    path = str(tmp_path / "beaglemem.db")
+    store = BeagleStore(path, create=True)
+    store.set_meta("dim", 2048)
+    store.set_meta("tokenizer_fingerprint", "abc123")
+    store.set_meta("regex", r"[a-z0-9]+")
+    store.set_meta("encoder_version", "idf-v1")
+    assert store.get_meta("dim") == 2048
+    assert store.get_meta("missing") is None
+    assert store.all_meta() == {
+        "dim": 2048,
+        "tokenizer_fingerprint": "abc123",
+        "regex": r"[a-z0-9]+",
+        "encoder_version": "idf-v1",
+    }
+    store.close()
+
+
+def test_vocab_replace_and_read(tmp_path):
+    """vocab table: idx is the beagle_mem.npy row index; replace is atomic."""
+    path = str(tmp_path / "beaglemem.db")
+    store = BeagleStore(path, create=True)
+    store.replace_vocab(["hello", "world"], {"hello": 5, "world": 3})
+    assert store.vocab_words() == ["hello", "world"]
+    assert store.vocab_rows() == [(0, "hello", 5), (1, "world", 3)]
+    store.replace_vocab(["a", "b", "c"], {"a": 1, "b": 2, "c": 3})
+    assert store.vocab_words() == ["a", "b", "c"]
+    assert store.vocab_rows() == [(0, "a", 1), (1, "b", 2), (2, "c", 3)]
+    store.close()
+
+
+def test_fact_ids_ordered(tmp_path):
+    """fact_ids() returns ids in fact_id order (in-memory row↔fact map)."""
+    path = str(tmp_path / "beaglemem.db")
+    store = BeagleStore(path, create=True)
+    a = store.add("x")
+    b = store.add("y")
+    store.remove(a)
+    c = store.add("z")
+    assert store.fact_ids() == [b, c]
+    store.close()
