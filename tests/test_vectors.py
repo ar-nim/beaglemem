@@ -79,3 +79,27 @@ def test_incremental_equals_batch():
     for s in sentences[half:]:
         inc.add_sentence(s)
     assert np.allclose(batch._mem[: batch.size], inc._mem[: inc.size])
+
+
+# --- Phase 0.5: storage-time min_count pruning (v0.2 grill Q4 fix) ---
+
+def test_min_count_prunes_at_storage_time():
+    """A word below min_count must NOT occupy a vocab slot or mem vector."""
+    m = BeagleModel(dim=64, window=2, min_count=2)
+    m.add_sentence(["rare", "common", "common", "common"])
+    m.add_sentence(["common", "common", "common", "common"])
+    # "rare" appeared once (< min_count=2) → must not be allocated
+    assert "rare" not in m.index
+    assert m.size == 1  # only "common"
+    # "common" is retrievable
+    assert m.mem_of("common") is not None
+
+
+def test_min_count_word_allocated_on_threshold_cross():
+    """A word at count 1 is pending; crossing to 2 allocates it."""
+    m = BeagleModel(dim=64, window=2, min_count=2)
+    m.add_sentence(["pending", "common", "common", "common"])
+    assert "pending" not in m.index  # count 1, not yet allocated
+    m.add_sentence(["pending", "common", "common", "common"])
+    assert "pending" in m.index      # count 2, now allocated
+    assert m.mem_of("pending") is not None

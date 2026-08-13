@@ -79,11 +79,20 @@ class BeagleModel:
         return idx
 
     def add_sentence(self, words: list[str]) -> None:
-        # Track frequency for min_count pruning
+        # Track frequency for min_count pruning FIRST. Words below min_count
+        # are never allocated — they get a count but no vocab slot or vector.
+        # Storage-time pruning (v0.2): a word at count 1 today becomes count 2
+        # tomorrow, crossing the threshold in a later add_sentence and getting
+        # allocated then. Incremental update still equals batch because a
+        # sub-threshold word contributes zero co-occurrence by definition.
         for w in words:
             self._counts[w] = self._counts.get(w, 0) + 1
 
-        idxs = [self._ensure_word(w) for w in words]
+        # Only words that have REACHED min_count get allocated + co-occur.
+        eligible = [w for w in words if self._counts[w] >= self.min_count]
+        if not eligible:
+            return
+        idxs = [self._ensure_word(w) for w in eligible]
         n = len(idxs)
         touched: set[int] = set()
         for i, wi in enumerate(idxs):
@@ -92,7 +101,7 @@ class BeagleModel:
             acc = np.zeros(self.dim, dtype=np.float32)
             for j in range(lo, hi):
                 if j != i:
-                    acc += self.env_of(words[j])
+                    acc += self.env_of(eligible[j])
             self._mem[wi] += acc
             touched.add(wi)
         for wi in touched:
