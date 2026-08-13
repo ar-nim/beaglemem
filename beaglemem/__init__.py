@@ -56,6 +56,7 @@ class BeagleMemoryProvider(MemoryProvider):
         self._idf = None  # cached IDF weights (idf.json)
         self._initialized = False
         self._sync_thread = None
+        self._pending_notice = None  # user-visible warning (rebuild events)
 
     # -- required lifecycle -------------------------------------------------
 
@@ -110,6 +111,12 @@ class BeagleMemoryProvider(MemoryProvider):
                 logging.getLogger("beaglemem").warning(
                     "beaglemem: tokenizer changed — rebuilding from corpus_archive.txt"
                 )
+                self._pending_notice = (
+                    "⚠️ beaglemem: tokenizer changed — memory vectors are being "
+                    "rebuilt from session history. Search stays FTS5-only until "
+                    "the rebuild completes (a few seconds). This happens after "
+                    "an upgrade that changes how text is tokenized."
+                )
                 # Clear BOTH model and fact cache. The stale fact_vectors.npy
                 # was built against the OLD model — serving it is wrong.
                 # Degrade to FTS5-only until the rebuild completes.
@@ -136,6 +143,11 @@ class BeagleMemoryProvider(MemoryProvider):
             import logging
             logging.getLogger("beaglemem").warning(
                 "beaglemem: encoder changed — re-encoding fact cache"
+            )
+            self._pending_notice = (
+                "⚠️ beaglemem: encoder changed — fact vectors are being "
+                "re-encoded with the new version. Retrieval quality is "
+                "unaffected, but the cache rebuild takes a moment."
             )
             self._fact_vectors = None  # forces _rebuild_fact_cache() on next use
 
@@ -503,10 +515,10 @@ class BeagleMemoryProvider(MemoryProvider):
         # Vectors build automatically from session 1 via sync_turn →
         # corpus_archive → on_session_end incremental update.
 
-        # If nothing found at all, return empty
+        # If nothing found at all, return empty (but still surface a notice)
         all_ids = set(fts_ids) | set(beagle_ids)
         if not all_ids:
-            return ""
+            return self._with_notice("")
 
         # Fuse by RRF — fact in both paths outranks fact in one
         fused = rrf([fts_ids, beagle_ids], k=60)
@@ -530,7 +542,17 @@ class BeagleMemoryProvider(MemoryProvider):
             tag = "+".join(paths) if paths else "?"
             lines.append(f"- [{weighted_score:.4f} {tag} trust:{trust:.1f}] {text[:200]}")
 
-        return "Relevant memories (fused FTS5+BEAGLE):\n" + "\n".join(lines)
+        return self._with_notice("Relevant memories (fused FTS5+BEAGLE):\n" + "\n".join(lines))
+
+    def _with_notice(self, output: str) -> str:
+        """Prepend a pending user-facing notice (rebuild events) once."""
+        if self._pending_notice:
+            notice = self._pending_notice
+            self._pending_notice = None  # show once
+            if output:
+                return notice + "\n\n" + output
+            return notice
+        return output
 
     def _prefetch_beagle_only(self, query: str) -> str:
         """Fallback when no SQLite store (demo mode / first run)."""
