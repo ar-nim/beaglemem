@@ -158,3 +158,102 @@ def test_initial_build_writes_watermark(tmp_path):
     with open(stamp_path) as fh:
         stamp = json.load(fh)
     assert stamp["last_seen_id"] == 50  # max id of the 50-message corpus
+
+
+# --- Phase 7: encoder version co-located with the fact cache ---
+
+def _make_matching_fact_cache(data_dir: str, encoder_version: str,
+                              ids=(1, 2)) -> None:
+    """Write fact_vectors.npy + fact_ids.json manifest (dict, versioned)."""
+    os.makedirs(data_dir, exist_ok=True)
+    np.save(os.path.join(data_dir, "fact_vectors.npy"),
+            np.zeros((len(ids), 64), dtype=np.float32))
+    with open(os.path.join(data_dir, "fact_ids.json"), "w") as fh:
+        json.dump({"encoder_version": encoder_version, "ids": list(ids)}, fh)
+
+
+def test_save_fact_cache_embeds_encoder_version(tmp_path):
+    """_save_fact_cache must persist encoder_version INSIDE fact_ids.json —
+    no separate fact_cache_meta.json flag file (the 2026-08-13 false-alarm)."""
+    from beaglemem.fingerprint import ENCODER_VERSION
+    data_dir = tmp_path / "beaglemem-data"
+    data_dir.mkdir()
+    p = BeagleMemoryProvider()
+    p._data_dir = str(data_dir)
+    p._fact_vectors = (np.zeros((2, 64), dtype=np.float32), [1, 2])
+    p._save_fact_cache()
+    with open(data_dir / "fact_ids.json") as fh:
+        manifest = json.load(fh)
+    assert manifest == {"encoder_version": ENCODER_VERSION, "ids": [1, 2]}
+    # No separate flag file is written — the version rides with the cache.
+    assert not (data_dir / "fact_cache_meta.json").exists()
+
+
+def test_matching_encoder_version_no_false_reencode(tmp_path):
+    """A fact cache whose manifest version matches must load WITHOUT firing
+    the 'encoder changed' notice. (Regression: a missing separate meta file
+    used to fire it on every session.)"""
+    from beaglemem.fingerprint import ENCODER_VERSION
+    data_dir = tmp_path / "beaglemem-data"
+    _make_matching_fact_cache(str(data_dir), ENCODER_VERSION)
+    _make_small_corpus(str(tmp_path / "state.db"), n=5)
+
+    p = BeagleMemoryProvider()
+    p.initialize(session_id="test", hermes_home=str(tmp_path))
+
+    assert p._fact_vectors is not None
+    assert p._pending_notice is None
+
+
+def test_missing_fact_cache_no_false_encoder_notice(tmp_path):
+    """A missing/deleted fact cache must NOT fire 'encoder changed'. The cache
+    is simply absent, not version-mismatched — re-encode happens naturally on
+    next build, without alarming the user about a version change."""
+    data_dir = tmp_path / "beaglemem-data"
+    data_dir.mkdir()
+    # fact_vectors.npy exists but fact_ids.json was deleted.
+    np.save(str(data_dir / "fact_vectors.npy"),
+            np.zeros((2, 64), dtype=np.float32))
+    _make_small_corpus(str(tmp_path / "state.db"), n=5)
+
+    p = BeagleMemoryProvider()
+    p.initialize(session_id="test", hermes_home=str(tmp_path))
+
+    assert p._fact_vectors is None          # cache can't load without IDs
+    assert p._pending_notice is None        # and no false version alarm
+
+
+def test_encoder_version_mismatch_still_reeencodes(tmp_path):
+    """A version mismatch (old encoder) must still clear the cache and set
+    the notice — the guard is real, just no longer triggered by a missing
+    file."""
+    data_dir = tmp_path / "beaglemem-data"
+    _make_matching_fact_cache(str(data_dir), "idf-v0-OLD")
+    _make_small_corpus(str(tmp_path / "state.db"), n=5)
+
+    p = BeagleMemoryProvider()
+    p.initialize(session_id="test", hermes_home=str(tmp_path))
+
+    assert p._fact_vectors is None
+    assert p._pending_notice is not None
+    assert "encoder" in p._pending_notice.lower()
+
+
+def test_legacy_barelist_cache_silently_reeencodes(tmp_path):
+    """A legacy bare-list fact_ids.json (pre-versioning) must re-encode but
+    WITHOUT the 'encoder changed' notice — the encoder didn't change, we just
+    never recorded it. This is the exact migration path after upgrading (the
+    old code wrote bare lists)."""
+    data_dir = tmp_path / "beaglemem-data"
+    data_dir.mkdir()
+    np.save(str(data_dir / "fact_vectors.npy"),
+            np.zeros((2, 64), dtype=np.float32))
+    with open(data_dir / "fact_ids.json", "w") as fh:
+        json.dump([1, 2], fh)  # legacy bare list, no version
+    _make_small_corpus(str(tmp_path / "state.db"), n=5)
+
+    p = BeagleMemoryProvider()
+    p.initialize(session_id="test", hermes_home=str(tmp_path))
+
+    assert p._fact_vectors is None          # re-encoded (cleared)
+    assert p._pending_notice is None        # but silently — no false alarm

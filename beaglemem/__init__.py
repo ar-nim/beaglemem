@@ -63,6 +63,7 @@ class BeagleMemoryProvider(MemoryProvider):
         self._model = None
         self._store = None
         self._fact_vectors = None  # cached (matrix, ids) from disk
+        self._stored_encoder_version = None  # encoder version read from the manifest
         self._idf = None  # cached IDF weights (idf.json)
         self._initialized = False
         self._sync_thread = None
@@ -97,14 +98,29 @@ class BeagleMemoryProvider(MemoryProvider):
         if os.path.exists(vocab_path):
             self._model = BeagleModel.load(self._data_dir)
 
-        # Load cached fact vectors if built
+        # Load cached fact vectors if built. The fact cache is a PAIR:
+        # fact_vectors.npy (the matrix) + fact_ids.json (a manifest carrying
+        # both the row→fact-id mapping AND the encoder_version that produced
+        # the vectors). The version lives INSIDE the manifest, co-located with
+        # the data it guards — never in a separate flag file a user could
+        # delete independently (2026-08-13 bug: a missing fact_cache_meta.json
+        # fired "encoder changed" on every session).
         fv_path = os.path.join(self._data_dir, "fact_vectors.npy")
         ids_path = os.path.join(self._data_dir, "fact_ids.json")
+        self._stored_encoder_version = None
         if os.path.exists(fv_path) and os.path.exists(ids_path):
-            self._fact_vectors = (
-                np.load(fv_path),
-                json.load(open(ids_path)),
-            )
+            try:
+                manifest = json.load(open(ids_path))
+            except Exception:
+                manifest = None
+            if isinstance(manifest, dict):
+                ids = manifest.get("ids", [])
+                self._stored_encoder_version = manifest.get("encoder_version")
+            else:
+                # Legacy bare-list format (pre-versioning): treat as unknown
+                # version so it re-encodes once, then persists the manifest.
+                ids = manifest or []
+            self._fact_vectors = (np.load(fv_path), ids)
 
         # --- Tokenizer fingerprint check (guards the corpus model) ---
         # A mismatch means the on-disk model was built with a DIFFERENT
@@ -188,25 +204,26 @@ class BeagleMemoryProvider(MemoryProvider):
         # --- Encoder version check (guards the fact cache only) ---
         # A mismatch means the fact vectors were encoded with a DIFFERENT
         # encoder (IDF formula). Only the fact cache is stale — re-encode.
+        # The version is read from the loaded manifest (co-located with the
+        # cache), NOT a separate flag file. A cache that was never loaded
+        # (missing/deleted files) is simply absent — not "changed" — so it
+        # must NOT fire this notice.
         from .fingerprint import ENCODER_VERSION
-        fact_meta_path = os.path.join(self._data_dir, "fact_cache_meta.json")
-        stored_enc = None
-        if os.path.exists(fact_meta_path):
-            try:
-                with open(fact_meta_path) as fh:
-                    stored_enc = json.load(fh).get("encoder_version")
-            except Exception:
-                stored_enc = None
-        if stored_enc != ENCODER_VERSION:
-            import logging
-            logging.getLogger("beaglemem").warning(
-                "beaglemem: encoder changed — re-encoding fact cache"
-            )
-            self._pending_notice = (
-                "⚠️ beaglemem: encoder changed — fact vectors are being "
-                "re-encoded with the new version. Retrieval quality is "
-                "unaffected, but the cache rebuild takes a moment."
-            )
+        if self._fact_vectors is not None and \
+                self._stored_encoder_version != ENCODER_VERSION:
+            # Legacy (no recorded version) re-encodes silently — the encoder
+            # didn't change, we just never stamped it. Only a genuine version
+            # bump (stored version present but different) is user-visible.
+            if self._stored_encoder_version is not None:
+                import logging
+                logging.getLogger("beaglemem").warning(
+                    "beaglemem: encoder changed — re-encoding fact cache"
+                )
+                self._pending_notice = (
+                    "⚠️ beaglemem: encoder changed — fact vectors are being "
+                    "re-encoded with the new version. Retrieval quality is "
+                    "unaffected, but the cache rebuild takes a moment."
+                )
             self._fact_vectors = None  # forces _rebuild_fact_cache() on next use
 
         # Connect to the self-owned SQLite store (creates if missing)
@@ -890,10 +907,11 @@ class BeagleMemoryProvider(MemoryProvider):
     def _save_fact_cache(self):
         if self._fact_vectors is None:
             return
+        from .fingerprint import ENCODER_VERSION
         matrix, ids = self._fact_vectors
         np.save(os.path.join(self._data_dir, "fact_vectors.npy"), matrix)
         with open(os.path.join(self._data_dir, "fact_ids.json"), "w") as fh:
-            json.dump(ids, fh)
+            json.dump({"encoder_version": ENCODER_VERSION, "ids": ids}, fh)
 
     def _rebuild_fact_cache(self):
         """Re-encode all fact vectors from the store using the current model."""
