@@ -113,3 +113,23 @@ data, synthesize it — never copy real values.
   → `ACCEPTANCE: PASS`.
 - Privacy grep (above) → zero matches.
 - `git status --short` → clean (or staged commits ready to push).
+
+## PR merge gate (enforced before merging ANY pull request)
+
+PRs are tested by `.github/workflows/ci.yml` — TWO jobs must pass before merge:
+
+1. **test-with-hermes** — installs Hermes (latest stable semver via pip, NOT
+   pinned, NOT git-main) and runs the full suite including the real-ABC
+   conformance test and the real-MemoryManager integration test. This job
+   fails if either Hermes-dependent test SKIPS — a future Hermes contract
+   change (ABC method added, hook signature changed) breaks here loudly.
+   This is the "does it still work as a Hermes plugin?" gate.
+2. **test-standalone** — runs WITHOUT Hermes: 85 tests must pass and the 2
+   Hermes-dependent tests must SKIP honestly. This is the "no regression for
+   standalone users / public forks" gate.
+
+Both jobs matrix over Python 3.11 / 3.12 / 3.13.
+
+Merge is blocked until BOTH jobs are green. A contributor cannot self-approve
+a PR that fails either job, even if local tests pass — local dev usually has
+Hermes present, which hides the standalone-skip path; CI exercises both.

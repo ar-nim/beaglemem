@@ -29,7 +29,13 @@ jobs:
       - name: Install test deps + Hermes
         run: |
           python -m pip install --upgrade pip
-          pip install pytest numpy hermes-agent
+          pip install pytest numpy
+          # Latest STABLE semver release — deliberately NOT pinned and NOT
+          # git-main. Pin would rot (miss contract drift); git-main would be
+          # bleeding-edge (test against unreleased churn). Latest stable is
+          # what real users run, so it's the correct drift detector. If a
+          # specific version is ever needed, pin with hermes-agent==X.Y.Z.
+          pip install hermes-agent
 
       - name: Verify Hermes is importable (this job MUST NOT skip the 2 tests)
         run: |
