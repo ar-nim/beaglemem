@@ -95,3 +95,15 @@
 ## Real-data acceptance (deployment-private)
 - verify.local.json (gitignored) holds deployment-specific pairs and probe
   tests. FAIL = report numbers verbatim, never tune thresholds.
+
+## Multilingual contract (v0.2)
+
+- NFKC normalization applied before tokenization (fullwidth → halfwidth)
+- Unicode word regex `[^\W_]` — superset of v0.1 ASCII regex
+- CJK runs extracted as char-bigrams (sliding 2-char window)
+- Script-aware noise filter: no-vowel hash check only applies to ASCII tokens
+- IDF weighting (`beaglemem/idf.py`) — language-agnostic stopword replacement
+- CJK single-char function words (的, は) dropped at tokenization (never enter vocab)
+- CJK multi-char particles (から, まで) downweighted by IDF automatically
+- Cross-lingual bridges form from shared co-occurrence, NOT translation
+- Deferred: abugida scripts (Hindi/Bengali/Telugu) — v0.3

@@ -111,14 +111,28 @@ If your source rotates or cleans itself (e.g., agent session cleanup), snapshot 
 ## Limitations
 
 - Corpus sparsity: needs enough co-occurrence (~1M+ words recommended; less works with weaker signal)
-- English-biased stopword list
 - No order encoding (v0.2 candidate)
 - No recency decay (equal weights, paper-faithful)
 - Dotted compounds (802.1q, v1.2) are split at the sentence/token level —
   deliberately NOT fixed: a dot-aware token rule was considered and rejected
   as too brittle for the co-occurrence gain
-- Language-agnostic co-occurrence; cross-lingual bridges form when languages
-  mix in the corpus (no explicit multilingual support)
+- **Multilingual support (v0.2):** Latin-script + diacritics (Spanish,
+  Portuguese, Vietnamese, Indonesian), Cyrillic (Russian), and CJK
+  char-bigrams (Mandarin Chinese, Japanese, Cantonese). Abugida scripts
+  (Hindi, Bengali, Telugu) are deferred to v0.3 — their consonant-vowel
+  ligature structure requires grapheme cluster tokenization that the
+  regex-based tokenizer can't handle yet.
+- **Cross-lingual bridges:** BEAGLE learns cross-lingual similarity from
+  shared co-occurrence context in mixed-language corpora. Searching
+  "meeting" can find a document containing "reunião" (Portuguese) if both
+  terms appear in code-switched context. This works naturally for
+  Latin↔Latin pairs; CJK↔Latin bridges are weaker due to script separation
+  and char-bigram fragmentation.
+- **IDF weighting** (v0.2) replaces the English stopword list. Language-
+  agnostic: universal hub words ("the", "yang", "から") are downweighted
+  by document frequency, no per-language lists needed. Single-char CJK
+  function words (的, は) are dropped at tokenization; multi-char particles
+  are handled by IDF.
 
 ## Roadmap
 
