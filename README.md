@@ -37,7 +37,7 @@ out of the co-occurrence statistics:
 2. **Token filters** — base64 padding, hashes, no-vowel runs, single chars,
    and >25-char strings are killed; short alphanumerics (6x, k3s, pq9) are
    kept as domain vocabulary; pure numbers become `<NUM>`
-3. **Line-length cap** — archive lines >1000 chars dropped (pasted code/logs)
+3. **Content cap** — corpus lines >1000 chars dropped (pasted code/logs)
 4. **min_count pruning** — words appearing <2 times are invisible to probe
    (frequency-based, Gensim/Word2Vec standard)
 
@@ -76,8 +76,8 @@ A build writes into the `--out` directory:
 | `beagle_vocab.json` | vocab list + frequency counts + model meta (dim/window/min_count) |
 | `fact_vectors.npy` | cached document vectors (rows = facts, cols = dim) |
 | `fact_ids.json` | fact IDs aligned with `fact_vectors.npy` rows |
-| `corpus_archive.txt` | compounding corpus (plugin writes every turn here) |
-| `last_update.json` | incremental offset/mtime stamp (update.py / plugin) |
+| `corpus_archive.txt` | **deprecated in v0.2 corpus-lifecycle refactor** — no longer written per-turn. Reserved as a future prune-insurance snapshot target only. |
+| `last_update.json` | incremental watermark — `{"last_seen_id": <max messages.id seen>}` (state.db read) |
 
 The fact-vector cache is why probe is fast: documents are encoded once at
 build, not on every query. `data/` and `verify.local.json` are gitignored —
@@ -110,11 +110,18 @@ and:
 
 ### Build + rebuild behavior
 
-Cold start works FTS5-only; vectors auto-build in the background from session
-history on first activation, and incremental updates run at session end (no
-progress bar — they're small). A **full build** (first run, or a rebuild after
-a tokenizer/encoder upgrade) shows a live progress bar via `beaglemem_status`;
-it is deliberately NOT injected into the conversation context.
+Cold start works FTS5-only; vectors auto-build in the background from
+`state.db` session history on first activation, and incremental updates read
+new messages by `id` watermark at session end (no progress bar — they're
+small). A **full build** (first run, or a rebuild after a tokenizer/encoder
+upgrade or damaged-vector detection) shows a live progress bar via
+`beaglemem_status`; it is deliberately NOT injected into the conversation
+context.
+
+**Stub detection:** the model persists `consumed_sentences` + `corpus_source`
+in its meta. On load, if the model was built from a non-canonical source, or
+is implausibly small vs the state.db corpus, it is treated as damaged and
+rebuilds from state.db with a user-visible notice via `beaglemem_status`.
 
 ## What this is NOT
 
@@ -124,7 +131,18 @@ it is deliberately NOT injected into the conversation context.
 
 ## Corpus lifecycle
 
-If your source rotates or cleans itself (e.g., agent session cleanup), snapshot new material into a compounding archive before cleanup. Vectors compound forever — the archive is rebuild insurance. Never reset vectors when the source prunes.
+**state.db is the single source of truth.** Every turn is already persisted
+there by Hermes core, so beaglemem reads it directly by `id` watermark — there
+is no per-turn mirror. Compaction soft-archives old rows (`active=0,
+compacted=1`) while preserving their raw text; beaglemem reads those rows too
+so pre-compaction vocabulary is not lost, and drops compaction summaries
+(`[CONTEXT COMPACTION%`) and rewind/undo rows (`active=0, compacted=0`).
+
+If your source rotates or cleans itself (e.g., agent session cleanup or
+`hermes sessions prune`), snapshot the material into `corpus_archive.txt`
+before cleanup — vectors compound forever, so the archive is rebuild insurance
+for content that state.db will lose. Never reset vectors when the source
+prunes.
 
 ## Limitations
 

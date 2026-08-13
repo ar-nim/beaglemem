@@ -9,17 +9,21 @@
   if path is a file, read it directly; if dir, glob *.txt + *.md; split on [.!?\n]+
 - state_db adapter (Hermes session store):
   - path = the state.db file (default: <hermes_home>/state.db)
-  - schema VERIFIED against hermes_state_common.py (source of truth),
+  - schema VERIFIED against hermes_state.py (source of truth),
     not assumed from live DB dumps
   - SELECT content FROM messages WHERE role IN ('user','assistant')
-    AND content IS NOT NULL AND content != '' AND active = 1
-    AND content NOT LIKE '[SYSTEM:%'
-  - tool rows excluded (role='tool' is output noise, 172M chars)
-  - do NOT filter on tool_calls presence: 43,847 empty-content tool-call
-    rows are dropped by content != '', but 13,202 carry real prose that
-    must be KEPT
-  - active=1 means: current view (compaction summaries included as
-    active rows; soft-archived originals excluded)
+    AND content IS NOT NULL AND content != '' AND (active = 1 OR compacted = 1)
+    AND content NOT LIKE '[SYSTEM:%' AND content NOT LIKE '[CONTEXT COMPACTION%'
+  - tool rows excluded (role='tool' is output noise, 147MB)
+  - do NOT filter on tool_calls presence: empty-content tool-call
+    rows are dropped by content != '', but tool-call rows carrying real
+    prose must be KEPT
+  - (active = 1 OR compacted = 1): live rows + soft-archived RAW rows.
+    Compaction soft-archives originals (active=0, compacted=1) and inserts
+    a lossy summary as a new active=1 row. Reading compacted=1 recovers
+    pre-compaction raw text; the summary row is dropped by the
+    [CONTEXT COMPACTION filter. active=0 AND compacted=0 (rewind/undo,
+    "user took it back") stays excluded.
 - Unknown format string → ValueError
 
 ## Vector contract
@@ -53,9 +57,19 @@
   No manual `hermes beaglemem build` needed for the initial experience.
 - `hermes beaglemem build` is for REBUILDS only (algorithm change,
   filter update, adding a custom corpus).
-- `sync_turn()` appends every turn to corpus_archive.txt.
-- `on_session_end()` runs incremental BEAGLE update from the appended
-  tail (byte-offset tracked). No double-counting, no re-reading history.
+- `sync_turn()` is a no-op — state.db is the canonical source of every
+  turn (Hermes core persists it per-turn). No mirror file is written.
+- `on_session_end()` runs incremental BEAGLE update from state.db by
+  `id` watermark (`WHERE id > last_seen_id`), stamping the watermark in
+  last_update.json. No double-counting, no re-reading history.
+- STUB GUARD: `on_session_end()` returns immediately when `_model is None`
+  — it never builds a fresh model from a partial tail. Model creation is
+  owned by the full auto-build path.
+- STUB DETECTION: the model meta persists `consumed_sentences` +
+  `corpus_source`. On load, a model that (a) was built from a non-canonical
+  source, (b) consumed <10% of the corpus's messages, or (c) has <100
+  words against >10K messages is treated as damaged: cleared, a rebuild
+  scheduled, and a user-visible notice set via `_pending_notice`.
 
 ## Migration contract (from holographic)
 - beaglemem's CLI (register_cli in cli.py) is only visible when beaglemem is
