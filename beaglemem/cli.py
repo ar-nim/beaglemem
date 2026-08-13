@@ -5,16 +5,19 @@ import os
 
 def _status(args):
     home = os.path.expanduser("~/.hermes")
-    data_dir = os.path.join(home, "beaglemem-data")
-    vocab = os.path.join(data_dir, "beagle_vocab.json")
-    if os.path.exists(vocab):
-        with open(vocab) as fh:
-            meta = json.load(fh)
-        n_facts = 0
-        fv = os.path.join(data_dir, "fact_ids.json")
-        if os.path.exists(fv):
-            n_facts = len(json.load(open(fv)))
-        print(f"Provider: beaglemem — model built ({len(meta['vocab'])} words, dim={meta['dim']}, {n_facts} facts cached)")
+    db_path = os.path.join(home, "beaglemem-data", "beaglemem.db")
+    if os.path.exists(db_path):
+        try:
+            from .store import BeagleStore
+            store = BeagleStore(db_path)
+            n_words = len(store.vocab_words())
+            meta = store.all_meta()
+            n_facts = len(store.fact_ids())
+            dim = meta.get("dim", "?")
+            print(f"Provider: beaglemem — model built ({n_words} words, dim={dim}, {n_facts} facts cached)")
+            store.close()
+        except Exception:
+            print("Provider: beaglemem — model NOT built yet. Run: hermes beaglemem build")
     else:
         print("Provider: beaglemem — model NOT built yet. Run: hermes beaglemem build")
 
@@ -79,16 +82,21 @@ def _migrate(args):
 
 
 def _build(args):
-    """Run the initial full BEAGLE build from configured corpus."""
+    """Run the initial full BEAGLE build from configured corpus (v0.3: DB)."""
     from .vectors import BeagleModel
     from .corpus import iter_sentences
     from .probe import build_doc_vectors
+    from .idf import build_idf
     from .store import BeagleStore
+    from .fingerprint import ENCODER_VERSION, tokenizer_fingerprint
+    from .corpus import WORD_RE
+    from .adapters.state_db import max_message_id
     import time
 
     home = os.path.expanduser("~/.hermes")
     data_dir = os.path.join(home, "beaglemem-data")
     os.makedirs(data_dir, exist_ok=True)
+    db_path = os.path.join(data_dir, "beaglemem.db")
     # Read config from config.yaml (same convention as holographic)
     try:
         import yaml
@@ -98,41 +106,69 @@ def _build(args):
         cfg = {}
     corpus_dir = cfg.get("corpus_dir", os.path.join(home, "state.db"))
     fmt = cfg.get("format", "state_db")
-    db_path = cfg.get("db_path", os.path.join(home, "beaglemem-data", "beaglemem.db"))
+    dim = int(cfg.get("dim", 2048))
+    window = int(cfg.get("window", 3))
+
+    store = BeagleStore(db_path, create=True)
 
     t0 = time.time()
-    model = BeagleModel(dim=2048, window=3)
+    model = BeagleModel(dim=dim, window=window)
     n = 0
     for words in iter_sentences(corpus_dir, format=fmt):
         model.add_sentence(words)
         n += 1
         if n % 10000 == 0:
             print(f"  {n} sentences, {model.size} words, {time.time()-t0:.0f}s", flush=True)
-    model.save(data_dir)
+    model.corpus_source = "state_db"
+
+    # STAGE → VERIFY → SWAP (non-destructive)
+    import numpy as np
+    mem_path = os.path.join(data_dir, "beagle_mem.npy")
+    tmp_path = mem_path + ".tmp"
+    model.save_matrix(tmp_path)
+    if model.size == 0:
+        raise SystemExit("Empty vocab — refusing to persist. Is the corpus empty?")
+    mem = np.load(tmp_path)
+    if mem.shape[0] != model.size or mem.shape[1] != model.dim:
+        raise SystemExit("Matrix verify failed")
+    del mem
+
+    current_fp = tokenizer_fingerprint(regex=WORD_RE.pattern, stemmer=None,
+                                       dim=model.dim, window=model.window)
+    store.persist_model(model.vocab, model._counts, {
+        "dim": model.dim, "window": model.window,
+        "min_count": model.min_count,
+        "tokenizer_fingerprint": current_fp,
+        "regex": WORD_RE.pattern, "stemmer": None,
+        "consumed_sentences": model.consumed_sentences,
+        "corpus_source": "state_db",
+        "last_seen_id": max_message_id(corpus_dir),
+        "encoder_version": ENCODER_VERSION,
+    })
+    os.replace(tmp_path, mem_path)
     print(f"Model: {model.size} words from {n} sentences in {time.time()-t0:.0f}s")
 
-    # Build fact cache from the store
-    if os.path.exists(db_path):
-        store = BeagleStore(db_path)
-        docs = store.documents()
-        if not docs:
-            print("\n⚠ beaglemem.db has 0 facts. Vector cache will be empty.")
-            builtin = os.path.join(home, "memory_store.db")
-            if os.path.exists(builtin):
-                print(f"  Found existing memory at {builtin}")
-                print(f"  Run: hermes beaglemem migrate --source {builtin}")
-                print(f"  Then re-run: hermes beaglemem build")
-            elif os.path.exists(os.path.join(home, "state.db")):
-                print(f"  Fresh install — facts will accumulate as you use the agent.")
-            store.close()
-        else:
-            matrix, ids = build_doc_vectors(model, docs)
-            import numpy as np
-            np.save(os.path.join(data_dir, "fact_vectors.npy"), matrix)
-            with open(os.path.join(data_dir, "fact_ids.json"), "w") as fh:
-                json.dump(ids, fh)
-            print(f"Fact vectors: {len(ids)} facts cached")
-            store.close()
+    # Build fact cache from the store (never-skip)
+    docs = store.documents()
+    if not docs:
+        print("\n⚠ beaglemem.db has 0 facts. Vector cache will be empty.")
+        builtin = os.path.join(home, "memory_store.db")
+        if os.path.exists(builtin):
+            print(f"  Found existing memory at {builtin}")
+            print(f"  Run: hermes beaglemem migrate --source {builtin}")
+            print(f"  Then re-run: hermes beaglemem build")
+        elif os.path.exists(os.path.join(home, "state.db")):
+            print(f"  Fresh install — facts will accumulate as you use the agent.")
+    else:
+        matrix, ids = build_doc_vectors(model, docs, build_idf(docs))
+        fv_path = os.path.join(data_dir, "fact_vectors.npy")
+        with open(fv_path + ".tmp", "wb") as fh:
+            np.save(fh, matrix)
+            os.fsync(fh.fileno())
+        os.replace(fv_path + ".tmp", fv_path)
+        store.set_meta("encoder_version", ENCODER_VERSION)
+        print(f"Fact vectors: {len(ids)} facts cached")
+    store.close()
 
 
 def register_cli(subparser) -> None:

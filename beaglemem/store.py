@@ -196,6 +196,28 @@ class BeagleStore:
 
     # -- v0.3: vocab table (idx is the beagle_mem.npy row index) ------------
 
+    def persist_model(self, words: list[str], counts: dict, meta: dict) -> None:
+        """Commit a full model build: vocab replace + meta upserts in ONE
+        transaction (v0.3 non-destructive rebuild step 5)."""
+        rows = [(i, w, int(counts.get(w, 0))) for i, w in enumerate(words)]
+        with self._lock:
+            self._conn.execute("BEGIN")
+            try:
+                self._conn.execute("DELETE FROM vocab")
+                self._conn.executemany(
+                    "INSERT INTO vocab (idx, word, count) VALUES (?, ?, ?)", rows
+                )
+                for k, v in meta.items():
+                    self._conn.execute(
+                        "INSERT INTO meta (key, value) VALUES (?, ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                        (k, json.dumps(v)),
+                    )
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+
     def replace_vocab(self, words: list[str], counts: dict) -> None:
         """Atomically replace the whole vocabulary (one transaction)."""
         rows = [(i, w, int(counts.get(w, 0))) for i, w in enumerate(words)]

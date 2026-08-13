@@ -63,12 +63,16 @@ class BeagleMemoryProvider(MemoryProvider):
         self._model = None
         self._store = None
         self._fact_vectors = None  # cached (matrix, ids) from disk
-        self._stored_encoder_version = None  # encoder version read from the manifest
-        self._idf = None  # cached IDF weights (idf.json)
+        self._stored_encoder_version = None  # encoder version read from DB meta
+        self._idf = None  # cached IDF weights (in-memory only, v0.3)
         self._initialized = False
         self._sync_thread = None
         self._pending_notice = None  # user-visible warning (rebuild events)
         self._build_progress = None  # (done, total) while a full build runs
+        self._config_dim = 2048  # v0.3: config takes top priority
+        self._config_window = 3
+        self._force_rebuild = False  # mandatory rebuild flag
+        self._stale_rebuild = False  # soft stale: keep serving + background rebuild
 
     # -- required lifecycle -------------------------------------------------
 
@@ -93,180 +97,49 @@ class BeagleMemoryProvider(MemoryProvider):
         self._corpus_db = corpus_db
         fmt = config.get("format", "state_db")
 
-        # Load BEAGLE model if built
-        vocab_path = os.path.join(self._data_dir, "beagle_vocab.json")
-        if os.path.exists(vocab_path):
-            self._model = BeagleModel.load(self._data_dir)
-
-        # Load cached fact vectors if built. The fact cache is a PAIR:
-        # fact_vectors.npy (the matrix) + fact_ids.json (a manifest carrying
-        # both the row→fact-id mapping AND the encoder_version that produced
-        # the vectors). The version lives INSIDE the manifest, co-located with
-        # the data it guards — never in a separate flag file a user could
-        # delete independently (2026-08-13 bug: a missing fact_cache_meta.json
-        # fired "encoder changed" on every session).
-        fv_path = os.path.join(self._data_dir, "fact_vectors.npy")
-        ids_path = os.path.join(self._data_dir, "fact_ids.json")
-        self._stored_encoder_version = None
-        if os.path.exists(fv_path) and os.path.exists(ids_path):
-            try:
-                manifest = json.load(open(ids_path))
-            except Exception:
-                manifest = None
-            if isinstance(manifest, dict):
-                ids = manifest.get("ids", [])
-                self._stored_encoder_version = manifest.get("encoder_version")
-            else:
-                # Legacy bare-list format (pre-versioning): treat as unknown
-                # version so it re-encodes once, then persists the manifest.
-                ids = manifest or []
-            self._fact_vectors = (np.load(fv_path), ids)
-
-        # --- Tokenizer fingerprint check (guards the corpus model) ---
-        # A mismatch means the on-disk model was built with a DIFFERENT
-        # tokenizer (e.g. v0.1 → v0.2 upgrade). Its vectors are stale and must
-        # be rebuilt from the raw corpus archive.
-        from .fingerprint import tokenizer_fingerprint
-        from .corpus import WORD_RE
-        _TOKENIZER_REGEX = WORD_RE.pattern  # single source of truth (v0.2)
-        if self._model is not None:
-            current_fp = tokenizer_fingerprint(
-                regex=_TOKENIZER_REGEX, stemmer=None,
-                dim=self._model.dim, window=self._model.window,
-            )
-            if self._model.tokenizer_fingerprint not in (None, current_fp):
-                import logging
-                logging.getLogger("beaglemem").warning(
-                    "beaglemem: tokenizer changed — rebuilding from state.db"
-                )
-                self._pending_notice = (
-                    "⚠️ beaglemem: tokenizer changed — memory vectors are being "
-                    "rebuilt from session history. Search stays FTS5-only until "
-                    "the rebuild completes (a few seconds). This happens after "
-                    "an upgrade that changes how text is tokenized."
-                )
-                # Clear BOTH model and fact cache. The stale fact_vectors.npy
-                # was built against the OLD model — serving it is wrong.
-                # Degrade to FTS5-only until the rebuild completes.
-                self._model = None
-                self._fact_vectors = None
-                stamp = os.path.join(self._data_dir, "last_update.json")
-                if os.path.exists(stamp):
-                    os.remove(stamp)
-                self._force_rebuild = True
-
-        # --- Stub detection (history-depth guard) ---
-        # A model that was recreated from the archive (or is implausibly small
-        # vs the corpus) has lost its history. Detect it and force a rebuild,
-        # exactly like a tokenizer fingerprint mismatch. Ratios are
-        # corpus-agnostic (same-corpus quantities), not tuned to any one store.
-        if self._model is not None:
-            import sqlite3 as _sq
-            try:
-                _conn = _sq.connect(f"file:{corpus_db}?mode=ro", uri=True)
-                _msg_count = _conn.execute(
-                    "SELECT COUNT(*) FROM messages WHERE role IN ('user','assistant') "
-                    "AND content IS NOT NULL AND content != ''"
-                ).fetchone()[0]
-                _conn.close()
-            except Exception:
-                _msg_count = 0
-            _stale = False
-            _reason = ""
-            src = getattr(self._model, "corpus_source", None)
-            consumed = getattr(self._model, "consumed_sentences", 0)
-            if src is not None and src != "state_db" and _msg_count > 100:
-                _stale = True
-                _reason = f"built from non-canonical source '{src}'"
-            elif consumed and _msg_count > 100 and consumed < _msg_count * 0.1:
-                _stale = True
-                _reason = f"consumed only {consumed} sentences vs {_msg_count} messages"
-            elif self._model.size < 100 and _msg_count > 10000:
-                _stale = True
-                _reason = f"vocab {self._model.size} words vs {_msg_count} messages"
-            if _stale:
-                import logging
-                logging.getLogger("beaglemem").warning(
-                    f"beaglemem: suspicious model ({_reason}) — rebuilding from state.db"
-                )
-                self._pending_notice = (
-                    "⚠️ beaglemem: memory vectors appear damaged or incomplete "
-                    f"({_reason}). Rebuilding from session history — search stays "
-                    "FTS5-only until done."
-                )
-                self._model = None
-                self._fact_vectors = None
-                _stamp = os.path.join(self._data_dir, "last_update.json")
-                if os.path.exists(_stamp):
-                    os.remove(_stamp)
-                self._force_rebuild = True
-
-        # --- Encoder version check (guards the fact cache only) ---
-        # A mismatch means the fact vectors were encoded with a DIFFERENT
-        # encoder (IDF formula). Only the fact cache is stale — re-encode.
-        # The version is read from the loaded manifest (co-located with the
-        # cache), NOT a separate flag file. A cache that was never loaded
-        # (missing/deleted files) is simply absent — not "changed" — so it
-        # must NOT fire this notice.
-        from .fingerprint import ENCODER_VERSION
-        if self._fact_vectors is not None and \
-                self._stored_encoder_version != ENCODER_VERSION:
-            # Legacy (no recorded version) re-encodes silently — the encoder
-            # didn't change, we just never stamped it. Only a genuine version
-            # bump (stored version present but different) is user-visible.
-            if self._stored_encoder_version is not None:
-                import logging
-                logging.getLogger("beaglemem").warning(
-                    "beaglemem: encoder changed — re-encoding fact cache"
-                )
-                self._pending_notice = (
-                    "⚠️ beaglemem: encoder changed — fact vectors are being "
-                    "re-encoded with the new version. Retrieval quality is "
-                    "unaffected, but the cache rebuild takes a moment."
-                )
-            self._fact_vectors = None  # forces _rebuild_fact_cache() on next use
+        # v0.3 config: dim/window are user-configurable — config takes top priority
+        self._config_dim = int(config.get("dim", 2048))
+        self._config_window = int(config.get("window", 3))
 
         # Connect to the self-owned SQLite store (creates if missing)
         if os.path.exists(db_path):
             try:
                 self._store = BeagleStore(db_path)
             except Exception:
-                pass  # defer; may need build first
+                self._store = None
         else:
             # First run — create the store
             try:
                 self._store = BeagleStore(db_path, create=True)
             except Exception:
-                pass
+                self._store = None
+
+        # MIGRATION: fold legacy JSON files into the DB tables (once).
+        self._migrate_legacy_json()
+
+        # LOAD persisted state: DB meta/vocab + .npy matrices, intrinsic
+        # checks, fingerprint compare + self-heal, fact cache (in-memory ids).
+        self._load_persisted_state()
 
         self._initial_build_started = False
 
-        # AUTO-BUILD: if no model exists but state.db has history, build
-        # vectors in a daemon thread. This is the ONLY way to guarantee users
-        # get semantic recall without manual steps. Without this, a user who
-        # activates beaglemem and skips `hermes beaglemem build` gets FTS5-only
-        # — identical to holographic. The whole point of switching is lost.
-        #
-        # Conditions:
-        #   1. _model is None (no beagle_vocab.json found)
-        #   2. state.db exists with content (not a truly fresh install)
-        #   3. not already started (idempotent — never re-trigger)
-        if self._model is None and not self._initial_build_started:
+        # AUTO-BUILD (or SOFT stale rebuild): if no model (or stale), build
+        # vectors in a daemon thread. Non-destructive: old artifacts are
+        # replaced only after the new build verifies.
+        if (self._model is None or getattr(self, "_stale_rebuild", False)) \
+                and not self._initial_build_started:
             try:
                 import sqlite3 as _sq
                 test_conn = _sq.connect(f"file:{corpus_db}?mode=ro", uri=True)
                 msg_count = test_conn.execute(
-                    "SELECT COUNT(*) FROM messages WHERE role IN ('user','assistant') AND content IS NOT NULL AND content != ''"
+                    "SELECT COUNT(*) FROM messages WHERE role IN ('user','assistant') "
+                    "AND content IS NOT NULL AND content != ''"
                 ).fetchone()[0]
                 test_conn.close()
-                # A tokenizer change (self._force_rebuild) is MANDATORY — it
-                # must rebuild even on a small corpus. Only the OPPORTUNISTIC
-                # first-run auto-build is gated by msg_count > 100.
+                # A forced rebuild (structural damage, config change, stale) is
+                # MANDATORY — it must rebuild even on a small corpus. Only the
+                # OPPORTUNISTIC first-run auto-build is gated by msg_count > 100.
                 if getattr(self, "_force_rebuild", False) or msg_count > 100:
-                    import logging
-                    logging.getLogger("beaglemem").info(
-                        f"beaglemem: auto-building vectors from {corpus_db} ({msg_count} messages) in background"
-                    )
                     self._initial_build_started = True
                     t = threading.Thread(
                         target=self._initial_build,
@@ -279,14 +152,224 @@ class BeagleMemoryProvider(MemoryProvider):
 
         self._initialized = True
 
-    def _initial_build(self, corpus_db: str, fmt: str, data_dir: str, db_path: str):
-        """Background daemon-thread build. Runs once on first activation when
-        state.db has history. Builds vocabulary + fact vectors. Non-blocking:
-        user chats normally (FTS5-only) while this runs. On completion, the
-        model is saved to disk; the NEXT session's initialize() loads it.
+    def _migrate_legacy_json(self) -> None:
+        """v0.3: fold legacy JSON files into the DB tables once, then remove
+        them. Cold start iff no DB tables and no legacy files."""
+        data_dir = self._data_dir
+        if self._store is None:
+            return
+        try:
+            if self._store.vocab_rows() or self._store.all_meta():
+                return  # already migrated
+        except Exception:
+            return
+        vocab_path = os.path.join(data_dir, "beagle_vocab.json")
+        if not os.path.exists(vocab_path):
+            return  # no legacy corpus model → cold start
+        try:
+            with open(vocab_path) as fh:
+                vmeta = json.load(fh)
+            words = vmeta.get("vocab", [])
+            counts = vmeta.get("counts", {})
+            from .corpus import WORD_RE
+            meta = {
+                "dim": vmeta.get("dim"),
+                "window": vmeta.get("window"),
+                "min_count": vmeta.get("min_count", 2),
+                "tokenizer_fingerprint": vmeta.get("tokenizer_fingerprint"),
+                # legacy models were built with the CURRENT code constants —
+                # they are the raw inputs that produced the stored fingerprint
+                "regex": WORD_RE.pattern,
+                "stemmer": None,
+                "consumed_sentences": vmeta.get("consumed_sentences", 0),
+                "corpus_source": vmeta.get("corpus_source"),
+            }
+            ids_path = os.path.join(data_dir, "fact_ids.json")
+            if os.path.exists(ids_path):
+                try:
+                    manifest = json.load(open(ids_path))
+                    if isinstance(manifest, dict):
+                        meta["encoder_version"] = manifest.get("encoder_version")
+                except Exception:
+                    pass
+            stamp_path = os.path.join(data_dir, "last_update.json")
+            if os.path.exists(stamp_path):
+                try:
+                    meta["last_seen_id"] = json.load(
+                        open(stamp_path)).get("last_seen_id", 0)
+                except Exception:
+                    pass
+            if words:
+                self._store.persist_model(words, counts, meta)
+            for f in ("beagle_vocab.json", "fact_ids.json", "idf.json",
+                      "last_update.json", "fact_cache_meta.json"):
+                p = os.path.join(data_dir, f)
+                if os.path.exists(p):
+                    os.remove(p)
+        except Exception:
+            pass  # migration is best-effort; a rebuild covers failure
 
-        Failures are logged but swallowed — the watermark in last_update.json
-        prevents re-triggering within the same session. A restart will retry.
+    def _build_model_from_parts(self, vocab_words, vocab_counts, mem, meta):
+        from .vectors import BeagleModel
+        return BeagleModel.from_parts(
+            vocab_words, vocab_counts, mem,
+            dim=int(meta.get("dim", self._config_dim)),
+            window=int(meta.get("window", self._config_window)),
+            min_count=int(meta.get("min_count", 2)),
+            consumed_sentences=int(meta.get("consumed_sentences", 0) or 0),
+            corpus_source=meta.get("corpus_source"),
+        )
+
+    def _load_persisted_state(self) -> None:
+        """v0.3 load path: DB meta + vocab, .npy matrices, intrinsic checks,
+        fingerprint compare + self-heal, fact cache with in-memory ids.
+
+        The fingerprint is a STALENESS HINT, not a destroy trigger. The
+        un-tamperable intrinsic checks (dim/shape from the .npy header, row
+        counts) are authoritative for "structurally broken". A fingerprint
+        mismatch on structurally-valid vectors keeps serving + background
+        rebuild; a hand-corrupted hash (raw inputs still match) self-heals.
+        """
+        data_dir = self._data_dir
+        mem_path = os.path.join(data_dir, "beagle_mem.npy")
+        fv_path = os.path.join(data_dir, "fact_vectors.npy")
+        self._stored_encoder_version = None
+        self._stale_rebuild = False
+        self._force_rebuild = False
+
+        meta = {}
+        vocab_words, vocab_counts = [], []
+        if self._store is not None:
+            try:
+                meta = self._store.all_meta()
+                rows = self._store.vocab_rows()
+                vocab_words = [w for _, w, _ in rows]
+                vocab_counts = {w: c for _, w, c in rows}
+            except Exception:
+                meta, vocab_words, vocab_counts = {}, [], {}
+
+        from .fingerprint import ENCODER_VERSION, tokenizer_fingerprint
+        from .corpus import WORD_RE
+        current_fp = tokenizer_fingerprint(
+            regex=WORD_RE.pattern, stemmer=None,
+            dim=self._config_dim, window=self._config_window,
+        )
+        stored_fp = meta.get("tokenizer_fingerprint")
+        fp_match = (stored_fp == current_fp)
+        stored_raw = {
+            "regex": meta.get("regex"), "stemmer": meta.get("stemmer"),
+            "dim": meta.get("dim"), "window": meta.get("window"),
+        }
+        current_raw = {
+            "regex": WORD_RE.pattern, "stemmer": None,
+            "dim": self._config_dim, "window": self._config_window,
+        }
+        raw_match = all(stored_raw[k] == current_raw[k] for k in current_raw)
+
+        # ---- corpus model ----
+        mem = None
+        if os.path.exists(mem_path) and vocab_words:
+            try:
+                mem = np.load(mem_path)
+            except Exception:
+                mem = None
+        stored_dim = int(meta.get("dim", 0) or 0)
+        structural_ok = (
+            mem is not None and stored_dim
+            and mem.shape[1] == stored_dim
+            and mem.shape[0] == len(vocab_words)
+            and stored_dim == self._config_dim  # config takes top priority
+        )
+
+        # stub detection (history-depth guard, v0.2 behavior preserved)
+        if structural_ok and self._store is not None:
+            try:
+                import sqlite3 as _sq
+                _conn = _sq.connect(f"file:{self._corpus_db}?mode=ro", uri=True)
+                _msg_count = _conn.execute(
+                    "SELECT COUNT(*) FROM messages WHERE role IN ('user','assistant') "
+                    "AND content IS NOT NULL AND content != ''"
+                ).fetchone()[0]
+                _conn.close()
+            except Exception:
+                _msg_count = 0
+            src = meta.get("corpus_source")
+            consumed = int(meta.get("consumed_sentences", 0) or 0)
+            if src is not None and src != "state_db" and _msg_count > 100:
+                structural_ok = False
+            elif consumed and _msg_count > 100 and consumed < _msg_count * 0.1:
+                structural_ok = False
+            elif len(vocab_words) < 100 and _msg_count > 10000:
+                structural_ok = False
+
+        if mem is None or not vocab_words:
+            # cold start (nothing persisted yet)
+            self._model = None
+            self._force_rebuild = True
+        elif not structural_ok:
+            # structurally broken → hard rebuild (non-destructive)
+            self._model = None
+            self._force_rebuild = True
+            self._pending_notice = (
+                "⚠️ beaglemem: memory vectors appear damaged or incomplete. "
+                "Rebuilding from session history — search stays FTS5-only "
+                "until done."
+            )
+        elif not fp_match and not raw_match:
+            # genuine config/code change, structurally valid → KEEP SERVING +
+            # background rebuild (soft stale)
+            self._model = self._build_model_from_parts(
+                vocab_words, vocab_counts, mem, meta)
+            self._force_rebuild = True
+            self._stale_rebuild = True
+        else:
+            self._model = self._build_model_from_parts(
+                vocab_words, vocab_counts, mem, meta)
+            if not fp_match and raw_match:
+                # hash field hand-corrupted → self-heal, no rebuild
+                if self._store is not None:
+                    self._store.set_meta("tokenizer_fingerprint", current_fp)
+
+        # ---- fact cache (in-memory ids; never-skip invariant) ----
+        ids = self._store.fact_ids() if self._store is not None else []
+        fv = None
+        if os.path.exists(fv_path):
+            try:
+                fv = np.load(fv_path)
+            except Exception:
+                fv = None
+        dim = stored_dim or self._config_dim
+        if fv is not None and ids and fv.shape[0] == len(ids) and fv.shape[1] == dim:
+            self._fact_vectors = (fv, ids)
+            self._stored_encoder_version = meta.get("encoder_version")
+            if self._stored_encoder_version != ENCODER_VERSION:
+                if self._stored_encoder_version is not None:
+                    self._pending_notice = (
+                        "⚠️ beaglemem: encoder changed — fact vectors are being "
+                        "re-encoded with the new version. Retrieval quality is "
+                        "unaffected, but the cache rebuild takes a moment."
+                    )
+                self._fact_vectors = None  # forces _rebuild_fact_cache()
+        else:
+            self._fact_vectors = None
+
+        # Re-encode fact cache if stale/missing and facts exist
+        if (self._store is not None and self._model is not None
+                and self._fact_vectors is None):
+            try:
+                if self._store.fact_ids():
+                    self._rebuild_fact_cache()
+            except Exception:
+                pass
+
+    def _initial_build(self, corpus_db: str, fmt: str, data_dir: str, db_path: str):
+        """Background daemon-thread build (auto-build + soft stale rebuild).
+
+        v0.3 non-destructive: STAGE → VERIFY → SWAP. The new model is built in
+        memory, written to .tmp, fsynced, verified (matrix rows == vocab size,
+        dim matches), the DB is committed (vocab + meta in ONE transaction),
+        and only then os.replace() swaps the matrix. A kill at any point leaves
+        the previous artifacts intact.
         """
         import logging
         logger = logging.getLogger("beaglemem")
@@ -294,52 +377,78 @@ class BeagleMemoryProvider(MemoryProvider):
             from .vectors import BeagleModel
             from .corpus import iter_sentences
             from .probe import build_doc_vectors
+            from .idf import build_idf
+            from .adapters.state_db import max_message_id
+            from .fingerprint import ENCODER_VERSION, tokenizer_fingerprint
+            from .corpus import WORD_RE
             import time
-            import numpy as np
 
             t0 = time.time()
-            model = BeagleModel(dim=2048, window=3)
+            model = BeagleModel(dim=self._config_dim, window=self._config_window)
 
             # Count total sentences first so we can show a progress bar.
-            # iter_sentences is a generator — count via a cheap first pass.
             total_sentences = 0
             for _ in iter_sentences(corpus_db, format=fmt):
                 total_sentences += 1
-
             n = 0
             self._build_progress = (0, total_sentences) if total_sentences else None
             for words in iter_sentences(corpus_db, format=fmt):
                 model.add_sentence(words)
                 n += 1
-                # Update progress ~every 1% (cheap, avoids lock contention)
                 if total_sentences and n % max(1, total_sentences // 100) == 0:
                     self._build_progress = (n, total_sentences)
             self._build_progress = None  # done
             model.corpus_source = "state_db"
-            model.save(data_dir)
-            # Stamp the incremental watermark so the next on_session_end does
-            # NOT re-read the whole corpus and double-count co-occurrence into
-            # this freshly built model (id-watermark semantics).
-            from .adapters.state_db import max_message_id
-            with open(os.path.join(data_dir, "last_update.json"), "w") as fh:
-                json.dump({"last_seen_id": max_message_id(corpus_db)}, fh)
+
+            # STAGE
+            mem_path = os.path.join(data_dir, "beagle_mem.npy")
+            tmp_path = mem_path + ".tmp"
+            model.save_matrix(tmp_path)  # fsyncs internally
+            # VERIFY
+            if model.size == 0:
+                raise ValueError("empty vocab — refusing to persist")
+            mem = np.load(tmp_path)
+            if mem.shape[0] != model.size or mem.shape[1] != self._config_dim:
+                raise ValueError("matrix verify failed")
+            del mem
+
+            # DB COMMIT (vocab + meta in one transaction)
+            current_fp = tokenizer_fingerprint(
+                regex=WORD_RE.pattern, stemmer=None,
+                dim=model.dim, window=model.window,
+            )
+            if self._store is not None:
+                self._store.persist_model(model.vocab, model._counts, {
+                    "dim": model.dim, "window": model.window,
+                    "min_count": model.min_count,
+                    "tokenizer_fingerprint": current_fp,
+                    "regex": WORD_RE.pattern, "stemmer": None,
+                    "consumed_sentences": model.consumed_sentences,
+                    "corpus_source": "state_db",
+                    "last_seen_id": max_message_id(corpus_db),
+                    "encoder_version": ENCODER_VERSION,
+                })
+            # SWAP (atomic)
+            os.replace(tmp_path, mem_path)
+            self._model = model
+            self._stale_rebuild = False
             logger.info(f"beaglemem: auto-build complete — {model.size} words from {n} sentences in {time.time()-t0:.0f}s")
 
-            # Build fact cache if store has facts
-            if os.path.exists(db_path):
-                store = BeagleStore(db_path)
-                docs = store.documents()
+            # Fact cache (never-skip) → atomic swap too
+            if self._store is not None:
+                docs = self._store.documents()
                 if docs:
-                    from .idf import build_idf
                     idf = build_idf(docs)
-                    with open(os.path.join(data_dir, "idf.json"), "w") as fh:
-                        json.dump(idf, fh)
                     matrix, ids = build_doc_vectors(model, docs, idf)
-                    np.save(os.path.join(data_dir, "fact_vectors.npy"), matrix)
-                    with open(os.path.join(data_dir, "fact_ids.json"), "w") as fh:
-                        json.dump(ids, fh)
-                    logger.info(f"beaglemem: fact vectors cached — {len(ids)} facts (idf v1)")
-                store.close()
+                    fv_path = os.path.join(data_dir, "fact_vectors.npy")
+                    fv_tmp = fv_path + ".tmp"
+                    with open(fv_tmp, "wb") as fh:
+                        np.save(fh, matrix)
+                        os.fsync(fh.fileno())
+                    os.replace(fv_tmp, fv_path)
+                    self._fact_vectors = (matrix, ids)
+                    self._stored_encoder_version = ENCODER_VERSION
+                    logger.info(f"beaglemem: fact vectors cached — {len(ids)} facts")
         except Exception as e:
             self._build_progress = None
             logger.warning(f"beaglemem: auto-build failed (will retry on restart): {e}")
@@ -369,6 +478,18 @@ class BeagleMemoryProvider(MemoryProvider):
                 "description": "Corpus format",
                 "default": "state_db",
                 "choices": ["plain", "chat-jsonl", "state_db"],
+            },
+            {
+                "key": "dim",
+                "description": "BEAGLE vector dimension (config takes priority; changing forces a full corpus rebuild)",
+                "default": 2048,
+                "secret": False,
+            },
+            {
+                "key": "window",
+                "description": "BEAGLE co-occurrence window (config takes priority; changing forces a full corpus rebuild)",
+                "default": 3,
+                "secret": False,
             },
         ]
 
@@ -510,11 +631,12 @@ class BeagleMemoryProvider(MemoryProvider):
             return {"error": "store not initialized"}
         # Autoincrement insert — no explicit fact_id (no race condition)
         fact_id = self._store.add(content, trust)
-        # Update vector cache if model is ready
+        # Update vector cache if model is ready (never-skip: zero vector ok)
         if self._model is not None:
             vec = encode_text(self._model, content, self._get_idf())
-            if vec is not None:
-                self._append_fact_vector(fact_id, vec)
+            if vec is None:
+                vec = np.zeros(self._model.dim, dtype=np.float32)
+            self._append_fact_vector(fact_id, vec)
         # Facts changed → IDF must be recomputed on next use
         self._idf = None
         return {"fact_id": fact_id, "stored": True}
@@ -745,8 +867,9 @@ class BeagleMemoryProvider(MemoryProvider):
                 fact_id = self._store.add(content, trust=0.5)
                 if self._model is not None:
                     vec = encode_text(self._model, content, self._get_idf())
-                    if vec is not None:
-                        self._append_fact_vector(fact_id, vec)
+                    if vec is None:
+                        vec = np.zeros(self._model.dim, dtype=np.float32)
+                    self._append_fact_vector(fact_id, vec)
                 self._idf = None  # facts changed → recompute on next use
             except Exception:
                 pass  # mirror is best-effort, never breaks the loop
@@ -786,14 +909,17 @@ class BeagleMemoryProvider(MemoryProvider):
         """Incremental BEAGLE update from state.db (id watermark).
 
         Reads ONLY messages with id > last_seen_id, then advances the
-        watermark. Re-reading the whole store every session would double-count.
-        The id watermark makes incremental == batch, exactly like the old
-        byte-offset did — but against the canonical store instead of a mirror.
+        watermark (stored in DB meta — v0.3). Re-reading the whole store every
+        session would double-count. The id watermark makes incremental == batch.
 
         STUB GUARD: if _model is None, return immediately. Never build a fresh
         model from a partial tail — that was the 2026-08-13 data-loss bug
         (a damaged archive tail produced an 80-word "complete" model). The full
         build path in initialize() owns the model-creation decision.
+
+        v0.3 non-destructive persist: matrix to .tmp, fsync, verify, DB commit
+        (vocab + meta incl. watermark in ONE transaction), then os.replace.
+        A kill mid-write leaves the previous artifacts intact.
         """
         if not self._initialized or not self._data_dir:
             return
@@ -804,12 +930,10 @@ class BeagleMemoryProvider(MemoryProvider):
             return  # full auto-build owns this; do not manufacture a stub
         from .adapters.state_db import iter_sentences_since, max_message_id
 
-        stamp = os.path.join(self._data_dir, "last_update.json")
         last_seen_id = 0
-        if os.path.exists(stamp):
+        if self._store is not None:
             try:
-                with open(stamp) as fh:
-                    last_seen_id = json.load(fh).get("last_seen_id", 0)
+                last_seen_id = int(self._store.get_meta("last_seen_id", 0) or 0)
             except Exception:
                 last_seen_id = 0
         max_id = max_message_id(corpus_db)
@@ -825,11 +949,34 @@ class BeagleMemoryProvider(MemoryProvider):
             logging.getLogger("beaglemem").warning(
                 f"beaglemem: {new_words} new words this session — possible corpus leak"
             )
-        model.save(self._data_dir)
+        # STAGE → VERIFY → SWAP (non-destructive)
+        data_dir = self._data_dir
+        mem_path = os.path.join(data_dir, "beagle_mem.npy")
+        tmp_path = mem_path + ".tmp"
+        model.save_matrix(tmp_path)  # fsyncs internally
+        mem = np.load(tmp_path)
+        if mem.shape[0] != model.size or mem.shape[1] != model.dim:
+            raise ValueError("matrix verify failed")
+        del mem
+        if self._store is not None:
+            from .fingerprint import tokenizer_fingerprint
+            from .corpus import WORD_RE
+            current_fp = tokenizer_fingerprint(
+                regex=WORD_RE.pattern, stemmer=None,
+                dim=model.dim, window=model.window,
+            )
+            self._store.persist_model(model.vocab, model._counts, {
+                "dim": model.dim, "window": model.window,
+                "min_count": model.min_count,
+                "tokenizer_fingerprint": current_fp,
+                "regex": WORD_RE.pattern, "stemmer": None,
+                "consumed_sentences": model.consumed_sentences,
+                "corpus_source": model.corpus_source,
+                "last_seen_id": max_id,
+            })
+        os.replace(tmp_path, mem_path)
         self._model = model
         self._rebuild_fact_cache()
-        with open(stamp, "w") as fh:
-            json.dump({"last_seen_id": max_id}, fh)
 
     def shutdown(self) -> None:
         self._initialized = False
@@ -856,11 +1003,12 @@ class BeagleMemoryProvider(MemoryProvider):
         return {}
 
     def _get_idf(self) -> dict:
-        """Return cached IDF weights, computing + caching from the store if absent.
+        """Return cached IDF weights, computing from the store if absent.
 
         IDF is ALWAYS-ON (v0.2): it replaces the STOPWORDS filter. It is
         computed from the fact store (a "document" = a fact) and invalidated
-        on on_memory_write (facts change df).
+        on on_memory_write (facts change df). v0.3: in-memory only — the
+        weights are re-derivable in ~ms, so no idf.json on disk.
         """
         if self._idf is not None:
             return self._idf
@@ -872,12 +1020,6 @@ class BeagleMemoryProvider(MemoryProvider):
             except Exception:
                 idf = {}
         self._idf = idf
-        # Cache to disk (idf.json)
-        try:
-            with open(os.path.join(self._data_dir, "idf.json"), "w") as fh:
-                json.dump(idf, fh)
-        except Exception:
-            pass
         return idf
 
     def _probe_facts(self, query: str, top_k: int = 5):
@@ -905,23 +1047,37 @@ class BeagleMemoryProvider(MemoryProvider):
                             for fid, s, t in results]}
 
     def _save_fact_cache(self):
+        """Persist the fact matrix atomically (tmp → fsync → os.replace).
+
+        v0.3: NO fact_ids.json — the row↔fact mapping is re-derived from the
+        DB (ORDER BY fact_id) at load; ids live in memory only. No
+        encoder_version file either — it lives in DB meta.
+        """
         if self._fact_vectors is None:
             return
-        from .fingerprint import ENCODER_VERSION
-        matrix, ids = self._fact_vectors
-        np.save(os.path.join(self._data_dir, "fact_vectors.npy"), matrix)
-        with open(os.path.join(self._data_dir, "fact_ids.json"), "w") as fh:
-            json.dump({"encoder_version": ENCODER_VERSION, "ids": ids}, fh)
+        matrix, _ids = self._fact_vectors
+        fv_path = os.path.join(self._data_dir, "fact_vectors.npy")
+        fv_tmp = fv_path + ".tmp"
+        with open(fv_tmp, "wb") as fh:
+            np.save(fh, matrix)
+            os.fsync(fh.fileno())
+        os.replace(fv_tmp, fv_path)
 
     def _rebuild_fact_cache(self):
         """Re-encode all fact vectors from the store using the current model."""
         if self._store is None or self._model is None:
             return
+        from .fingerprint import ENCODER_VERSION
         docs = self._store.documents()
         idf = self._get_idf()
         matrix, ids = build_doc_vectors(self._model, docs, idf)
         self._fact_vectors = (matrix, ids)
+        self._stored_encoder_version = ENCODER_VERSION
         self._save_fact_cache()
+        try:
+            self._store.set_meta("encoder_version", ENCODER_VERSION)
+        except Exception:
+            pass
 
 
 def register(ctx) -> None:

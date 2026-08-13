@@ -130,130 +130,173 @@ def test_stub_model_detected_and_flagged(tmp_path):
 
 def test_initial_build_stamps_source_and_consumed(tmp_path):
     """A full build from state.db must stamp corpus_source='state_db' and a
-    consumed_sentences > 0, so a later load is not false-flagged as a stub."""
+    consumed_sentences > 0 in the DB meta, so a later load is not
+    false-flagged as a stub. Zero JSON sidecars."""
     data_dir = tmp_path / "beaglemem-data"
     data_dir.mkdir()
     _make_big_corpus(str(tmp_path / "state.db"), n=50)
     p = BeagleMemoryProvider()
     p.initialize(session_id="test", hermes_home=str(tmp_path))
     p._initial_build(str(tmp_path / "state.db"), "state_db", str(data_dir), str(data_dir / "beaglemem.db"))
-    loaded = BeagleModel.load(str(data_dir))
-    assert loaded.corpus_source == "state_db"
-    assert loaded.consumed_sentences > 0
+    meta = p._store.all_meta()
+    assert meta.get("corpus_source") == "state_db"
+    assert int(meta.get("consumed_sentences", 0)) > 0
+    assert len(p._store.vocab_words()) > 0
+    assert os.path.exists(str(data_dir / "beagle_mem.npy"))
+    assert not os.path.exists(str(data_dir / "beagle_vocab.json"))
 
 
 def test_initial_build_writes_watermark(tmp_path):
-    """_initial_build must stamp last_update.json with the max message id so
-    the next on_session_end does NOT re-read the whole corpus and
+    """_initial_build must stamp the DB meta last_seen_id with the max message
+    id so the next on_session_end does NOT re-read the whole corpus and
     double-count co-occurrence into the fresh model."""
-    import json
     data_dir = tmp_path / "beaglemem-data"
     data_dir.mkdir()
     _make_big_corpus(str(tmp_path / "state.db"), n=50)
     p = BeagleMemoryProvider()
     p.initialize(session_id="test", hermes_home=str(tmp_path))
     p._initial_build(str(tmp_path / "state.db"), "state_db", str(data_dir), str(data_dir / "beaglemem.db"))
-    stamp_path = os.path.join(str(data_dir), "last_update.json")
-    assert os.path.exists(stamp_path)
-    with open(stamp_path) as fh:
-        stamp = json.load(fh)
-    assert stamp["last_seen_id"] == 50  # max id of the 50-message corpus
+    assert p._store.get_meta("last_seen_id") == 50  # max id of the 50-message corpus
+    assert not os.path.exists(str(data_dir / "last_update.json"))
 
 
-# --- Phase 7: encoder version co-located with the fact cache ---
+# --- Phase 7 (v0.3): load path — DB meta, fingerprint, encoder version ---
 
-def _make_matching_fact_cache(data_dir: str, encoder_version: str,
-                              ids=(1, 2)) -> None:
-    """Write fact_vectors.npy + fact_ids.json manifest (dict, versioned)."""
-    os.makedirs(data_dir, exist_ok=True)
-    np.save(os.path.join(data_dir, "fact_vectors.npy"),
-            np.zeros((len(ids), 64), dtype=np.float32))
-    with open(os.path.join(data_dir, "fact_ids.json"), "w") as fh:
-        json.dump({"encoder_version": encoder_version, "ids": list(ids)}, fh)
+def _make_built_state(tmp_path, encoder_version=None, dim=64, window=2,
+                      fingerprint_override=None, raw_override=None,
+                      n_facts=2, n_words=3):
+    """Create a full valid v0.3 state: DB (vocab+meta), beagle_mem.npy,
+    fact_vectors.npy, and a config.yaml matching the build shape."""
+    from beaglemem.fingerprint import ENCODER_VERSION, tokenizer_fingerprint
+    from beaglemem.corpus import WORD_RE
+    from beaglemem.store import BeagleStore
+    data_dir = tmp_path / "beaglemem-data"
+    data_dir.mkdir()
+    _make_small_corpus(str(tmp_path / "state.db"), n=5)
+
+    mem = np.random.RandomState(0).randn(n_words, dim).astype(np.float32)
+    np.save(str(data_dir / "beagle_mem.npy"), mem)
+    fv = np.random.RandomState(1).randn(n_facts, dim).astype(np.float32)
+    np.save(str(data_dir / "fact_vectors.npy"), fv)
+
+    store = BeagleStore(str(data_dir / "beaglemem.db"), create=True)
+    for i in range(n_facts):
+        store.add(f"fact content number {i} with enough words here")
+    current_fp = tokenizer_fingerprint(regex=WORD_RE.pattern, stemmer=None,
+                                       dim=dim, window=window)
+    store.persist_model(
+        ["word_a", "word_b", "word_c"],
+        {"word_a": 5, "word_b": 3, "word_c": 2},
+        {
+            "dim": dim, "window": window, "min_count": 2,
+            "tokenizer_fingerprint": fingerprint_override or current_fp,
+            "regex": WORD_RE.pattern, "stemmer": None,
+            "consumed_sentences": 100, "corpus_source": "state_db",
+            "last_seen_id": 5,
+            "encoder_version": encoder_version or ENCODER_VERSION,
+        },
+    )
+    if raw_override:
+        for k, v in raw_override.items():
+            store.set_meta(k, v)
+    store.close()
+    (tmp_path / "config.yaml").write_text(
+        f"plugins:\n  beaglemem:\n    dim: {dim}\n    window: {window}\n"
+    )
+    return str(data_dir)
 
 
-def test_save_fact_cache_embeds_encoder_version(tmp_path):
-    """_save_fact_cache must persist encoder_version INSIDE fact_ids.json —
-    no separate fact_cache_meta.json flag file (the 2026-08-13 false-alarm)."""
-    from beaglemem.fingerprint import ENCODER_VERSION
+def test_save_fact_cache_atomic_no_json(tmp_path):
+    """_save_fact_cache writes ONLY fact_vectors.npy, atomically. No
+    fact_ids.json / encoder manifest — ids come from the DB, encoder_version
+    lives in DB meta (v0.3 zero-JSON layout)."""
     data_dir = tmp_path / "beaglemem-data"
     data_dir.mkdir()
     p = BeagleMemoryProvider()
     p._data_dir = str(data_dir)
     p._fact_vectors = (np.zeros((2, 64), dtype=np.float32), [1, 2])
     p._save_fact_cache()
-    with open(data_dir / "fact_ids.json") as fh:
-        manifest = json.load(fh)
-    assert manifest == {"encoder_version": ENCODER_VERSION, "ids": [1, 2]}
-    # No separate flag file is written — the version rides with the cache.
+    assert (data_dir / "fact_vectors.npy").exists()
+    assert not (data_dir / "fact_vectors.npy.tmp").exists()  # no orphan tmp
+    assert not (data_dir / "fact_ids.json").exists()
     assert not (data_dir / "fact_cache_meta.json").exists()
+    assert np.load(str(data_dir / "fact_vectors.npy")).shape == (2, 64)
 
 
 def test_matching_encoder_version_no_false_reencode(tmp_path):
-    """A fact cache whose manifest version matches must load WITHOUT firing
-    the 'encoder changed' notice. (Regression: a missing separate meta file
-    used to fire it on every session.)"""
+    """A fact cache whose encoder_version matches must load WITHOUT firing
+    the 'encoder changed' notice. (Regression: the missing-meta false alarm.)"""
     from beaglemem.fingerprint import ENCODER_VERSION
-    data_dir = tmp_path / "beaglemem-data"
-    _make_matching_fact_cache(str(data_dir), ENCODER_VERSION)
-    _make_small_corpus(str(tmp_path / "state.db"), n=5)
-
+    _make_built_state(tmp_path, encoder_version=ENCODER_VERSION)
     p = BeagleMemoryProvider()
     p.initialize(session_id="test", hermes_home=str(tmp_path))
-
     assert p._fact_vectors is not None
     assert p._pending_notice is None
 
 
-def test_missing_fact_cache_no_false_encoder_notice(tmp_path):
-    """A missing/deleted fact cache must NOT fire 'encoder changed'. The cache
-    is simply absent, not version-mismatched — re-encode happens naturally on
-    next build, without alarming the user about a version change."""
-    data_dir = tmp_path / "beaglemem-data"
-    data_dir.mkdir()
-    # fact_vectors.npy exists but fact_ids.json was deleted.
-    np.save(str(data_dir / "fact_vectors.npy"),
-            np.zeros((2, 64), dtype=np.float32))
-    _make_small_corpus(str(tmp_path / "state.db"), n=5)
-
+def test_encoder_version_mismatch_triggers_reencode(tmp_path):
+    """A genuine encoder version bump re-encodes the fact cache at load and
+    surfaces a notice — the guard is real, now driven by DB meta."""
+    _make_built_state(tmp_path, encoder_version="idf-v0-OLD")
     p = BeagleMemoryProvider()
     p.initialize(session_id="test", hermes_home=str(tmp_path))
-
-    assert p._fact_vectors is None          # cache can't load without IDs
-    assert p._pending_notice is None        # and no false version alarm
-
-
-def test_encoder_version_mismatch_still_reeencodes(tmp_path):
-    """A version mismatch (old encoder) must still clear the cache and set
-    the notice — the guard is real, just no longer triggered by a missing
-    file."""
-    data_dir = tmp_path / "beaglemem-data"
-    _make_matching_fact_cache(str(data_dir), "idf-v0-OLD")
-    _make_small_corpus(str(tmp_path / "state.db"), n=5)
-
-    p = BeagleMemoryProvider()
-    p.initialize(session_id="test", hermes_home=str(tmp_path))
-
-    assert p._fact_vectors is None
     assert p._pending_notice is not None
     assert "encoder" in p._pending_notice.lower()
+    assert p._fact_vectors is not None          # re-encoded at load
+    assert p._fact_vectors[0].shape[0] == len(p._store.fact_ids())
 
 
-def test_legacy_barelist_cache_silently_reeencodes(tmp_path):
-    """A legacy bare-list fact_ids.json (pre-versioning) must re-encode but
-    WITHOUT the 'encoder changed' notice — the encoder didn't change, we just
-    never recorded it. This is the exact migration path after upgrading (the
-    old code wrote bare lists)."""
+def test_missing_fact_cache_no_false_encoder_notice(tmp_path):
+    """A missing/deleted fact cache must NOT fire 'encoder changed'. The cache
+    is simply absent, not version-mismatched."""
     data_dir = tmp_path / "beaglemem-data"
     data_dir.mkdir()
     np.save(str(data_dir / "fact_vectors.npy"),
             np.zeros((2, 64), dtype=np.float32))
-    with open(data_dir / "fact_ids.json", "w") as fh:
-        json.dump([1, 2], fh)  # legacy bare list, no version
     _make_small_corpus(str(tmp_path / "state.db"), n=5)
-
     p = BeagleMemoryProvider()
     p.initialize(session_id="test", hermes_home=str(tmp_path))
+    assert p._fact_vectors is None
+    assert p._pending_notice is None
 
-    assert p._fact_vectors is None          # re-encoded (cleared)
-    assert p._pending_notice is None        # but silently — no false alarm
+
+def test_fingerprint_hash_corruption_self_heals(tmp_path):
+    """A hand-corrupted hash (raw inputs still match) recomputes the hash and
+    does NOT rebuild — vectors keep serving."""
+    from beaglemem.fingerprint import tokenizer_fingerprint
+    from beaglemem.corpus import WORD_RE
+    _make_built_state(tmp_path, fingerprint_override="deadbeef00000000")
+    p = BeagleMemoryProvider()
+    p.initialize(session_id="test", hermes_home=str(tmp_path))
+    assert p._model is not None
+    assert p._force_rebuild is False
+    expected = tokenizer_fingerprint(regex=WORD_RE.pattern, stemmer=None,
+                                     dim=64, window=2)
+    assert p._store.get_meta("tokenizer_fingerprint") == expected
+
+
+def test_window_change_soft_stale_keeps_serving(tmp_path):
+    """A genuine non-structural config change (window) keeps the old vectors
+    serving and schedules a background rebuild — vectors are never dropped."""
+    _make_built_state(tmp_path)  # built with window=2
+    (tmp_path / "config.yaml").write_text(
+        "plugins:\n  beaglemem:\n    dim: 64\n    window: 3\n"
+    )
+    p = BeagleMemoryProvider()
+    p.initialize(session_id="test", hermes_home=str(tmp_path))
+    assert p._model is not None              # KEEP SERVING
+    assert p._initial_build_started is True  # background rebuild scheduled
+
+
+def test_dim_change_hard_rebuild(tmp_path):
+    """A genuine dim change makes the old vectors structurally unusable →
+    hard rebuild (non-destructive), with a notice."""
+    _make_built_state(tmp_path)  # built with dim=64
+    (tmp_path / "config.yaml").write_text(
+        "plugins:\n  beaglemem:\n    dim: 128\n    window: 2\n"
+    )
+    p = BeagleMemoryProvider()
+    p.initialize(session_id="test", hermes_home=str(tmp_path))
+    assert p._model is None
+    assert p._force_rebuild is True
+    assert p._pending_notice is not None

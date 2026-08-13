@@ -54,15 +54,26 @@ def build_doc_vectors(model, docs: list[dict], idf: dict = None):
 
     idf: optional. When None, computed from the docs themselves (standalone
     use); the plugin passes a cached idf for consistency across builds.
+
+    v0.3 never-skip contract: EVERY fact gets a row. A fact with no vocab
+    overlap gets a ZERO vector — probe filters sims > 0.01, so it never
+    surfaces (behaviorally identical to skipping). Keeping rows == len(docs)
+    == fact count is what makes the row↔fact mapping derivable from the DB
+    alone, so fact_ids does not need to be persisted on disk.
     """
     if idf is None:
         idf = build_idf(docs)
     rows, ids = [], []
+    zero = None
     for d in docs:
         v = encode_text(model, d["text"], idf)
         if v is not None:
             rows.append(v)
-            ids.append(d["id"])
+        else:
+            if zero is None:
+                zero = np.zeros(model.dim, dtype=np.float32)
+            rows.append(zero)
+        ids.append(d["id"])
     if not rows:
         return np.zeros((0, model.dim), dtype=np.float32), []
     return np.stack(rows), ids

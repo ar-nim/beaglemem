@@ -53,19 +53,33 @@ def test_on_session_end_without_model_does_not_create_stub(tmp_path):
 
 def test_on_session_end_increments_by_watermark(tmp_path):
     """A built model absorbs only NEW messages (id > last_seen_id), then
-    advances the watermark."""
+    advances the watermark (stored in DB meta, v0.3)."""
     data_dir = tmp_path / "beaglemem-data"
     data_dir.mkdir()
     state_db = str(tmp_path / "state.db")
     _make_state_db(state_db, n=10, start=1)
 
     from beaglemem.adapters.state_db import iter_sentences_since
+    from beaglemem.store import BeagleStore
+    from beaglemem.fingerprint import tokenizer_fingerprint
+    from beaglemem.corpus import WORD_RE
     model = BeagleModel(dim=64, window=2, min_count=1)
     for words in iter_sentences_since(state_db, 0):
         model.add_sentence(words)
-    model.save(str(data_dir))
-    with open(str(data_dir / "last_update.json"), "w") as fh:
-        json.dump({"last_seen_id": 5}, fh)
+    model.save_matrix(str(data_dir / "beagle_mem.npy"))
+    current_fp = tokenizer_fingerprint(regex=WORD_RE.pattern, stemmer=None,
+                                       dim=model.dim, window=model.window)
+    store = BeagleStore(str(data_dir / "beaglemem.db"), create=True)
+    store.persist_model(model.vocab, model._counts, {
+        "dim": model.dim, "window": model.window, "min_count": model.min_count,
+        "tokenizer_fingerprint": current_fp, "regex": WORD_RE.pattern,
+        "stemmer": None, "consumed_sentences": model.consumed_sentences,
+        "corpus_source": "state_db", "last_seen_id": 5,
+    })
+    store.close()
+    (tmp_path / "config.yaml").write_text(
+        "plugins:\n  beaglemem:\n    dim: 64\n    window: 2\n"
+    )
 
     p = BeagleMemoryProvider()
     p.initialize(session_id="test", hermes_home=str(tmp_path))
@@ -73,6 +87,4 @@ def test_on_session_end_increments_by_watermark(tmp_path):
     p.on_session_end()
     after = p._model.consumed_sentences
     assert after > before  # absorbed the 5 new messages (ids 6..10)
-    with open(str(data_dir / "last_update.json")) as fh:
-        stamp = json.load(fh)
-    assert stamp["last_seen_id"] == 10
+    assert p._store.get_meta("last_seen_id") == 10

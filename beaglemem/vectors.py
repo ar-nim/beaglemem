@@ -147,6 +147,33 @@ class BeagleModel:
                 "corpus_source": getattr(self, "corpus_source", None),
             }, fh)
 
+    def save_matrix(self, path: str) -> None:
+        """Write ONLY the memory matrix to the EXACT path (no .npy extension
+        appending). np.save() appends '.npy' to a path that doesn't end in
+        '.npy' — writing into a file object avoids that, so callers can stage
+        to a .tmp name and os.replace() it (v0.3 non-destructive rebuild)."""
+        with open(path, "wb") as fh:
+            np.save(fh, self._mem[: self.size])
+            os.fsync(fh.fileno())
+
+    @classmethod
+    def from_parts(cls, vocab, counts, mem, dim, window, min_count=2,
+                   consumed_sentences=0, corpus_source=None):
+        """Reconstruct a model from DB-stored parts (v0.3 load path). `mem`
+        is the (n, dim) matrix; vocab order maps rows; counts drive min_count
+        eligibility."""
+        model = cls(dim=dim, window=window, min_count=min_count,
+                    capacity=max(1024, len(vocab)))
+        model.vocab = list(vocab)
+        model.index = {w: i for i, w in enumerate(model.vocab)}
+        model._counts = dict(counts)
+        model._mem = np.zeros((model._capacity, model.dim), dtype=np.float32)
+        model._mem[: len(vocab)] = mem
+        model.size = len(vocab)
+        model.consumed_sentences = consumed_sentences
+        model.corpus_source = corpus_source
+        return model
+
     @classmethod
     def load(cls, in_dir: str) -> "BeagleModel":
         with open(os.path.join(in_dir, "beagle_vocab.json")) as fh:

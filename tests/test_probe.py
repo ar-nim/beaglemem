@@ -52,3 +52,23 @@ def test_probe_exact_match_still_works():
 def test_probe_empty_query():
     store = MemoryStore([{"id": 1, "text": "anything at all here"}])
     assert probe(_trained_model(), "", store) == []
+
+
+def test_build_doc_vectors_never_skips():
+    """v0.3 never-skip contract: EVERY fact gets a row. Unencodable facts
+    (no vocab overlap) get a ZERO vector — rows must equal len(docs) so the
+    row↔fact mapping is derivable from the DB alone (fact_ids not stored)."""
+    model = BeagleModel(dim=64, window=2, min_count=1)
+    model.add_sentence(["alpha", "beta", "gamma"])
+
+    docs = [
+        {"id": 1, "text": "alpha beta gamma"},   # encodable
+        {"id": 2, "text": "zzzqqq"},              # no vocab overlap → unencodable
+        {"id": 3, "text": "alpha zzzqqq"},        # partial overlap → encodable
+    ]
+    from beaglemem.idf import build_idf
+    matrix, ids = build_doc_vectors(model, docs, build_idf(docs))
+    assert ids == [1, 2, 3]           # never skips
+    assert matrix.shape == (3, 64)    # rows == len(docs)
+    assert (matrix[1] == 0).all()     # unencodable → zero vector
+    assert not (matrix[0] == 0).all()
