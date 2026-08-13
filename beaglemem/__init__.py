@@ -406,6 +406,17 @@ class BeagleMemoryProvider(MemoryProvider):
                     "required": ["fact_id", "feedback"],
                 },
             },
+            {
+                "name": "beaglemem_status",
+                "description": "Report memory build status: whether the BEAGLE vector model is built, "
+                               "in progress (with percentage), or failed. Also reports fact store size. "
+                               "Call this when the user asks about memory status or after an upgrade "
+                               "that may trigger a rebuild.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                },
+            },
         ]
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
@@ -417,6 +428,8 @@ class BeagleMemoryProvider(MemoryProvider):
             return json.dumps(self._tool_search(args.get("query", ""), args.get("top_k", 5)))
         elif tool_name == "beaglemem_feedback":
             return json.dumps(self._tool_feedback(args.get("fact_id"), args.get("feedback")))
+        elif tool_name == "beaglemem_status":
+            return json.dumps(self._tool_status())
         return json.dumps({"error": f"unknown tool: {tool_name}"})
 
     # -- tool handlers -------------------------------------------------------
@@ -434,6 +447,34 @@ class BeagleMemoryProvider(MemoryProvider):
         # Facts changed → IDF must be recomputed on next use
         self._idf = None
         return {"fact_id": fact_id, "stored": True}
+
+    def _tool_status(self) -> dict:
+        """Report build status + store size on demand (no context pollution)."""
+        status = {}
+        if self._build_progress is not None:
+            done, total = self._build_progress
+            status["build"] = "in_progress"
+            status["progress"] = _render_progress(done, total)
+            status["done"] = done
+            status["total"] = total
+        elif self._model is not None:
+            status["build"] = "complete"
+            status["model_size"] = self._model.size
+            status["dim"] = self._model.dim
+        else:
+            status["build"] = "not_built"
+        # Fact store size
+        if self._store is not None:
+            try:
+                status["facts"] = len(self._store.documents())
+            except Exception:
+                status["facts"] = None
+        else:
+            status["facts"] = None
+        if self._pending_notice:
+            status["notice"] = self._pending_notice
+            self._pending_notice = None  # clear after reporting once
+        return status
 
     def _append_fact_vector(self, fact_id: int, vec) -> None:
         """Append a fact's vector to the in-memory cache + persist."""
@@ -569,22 +610,12 @@ class BeagleMemoryProvider(MemoryProvider):
         return self._with_notice("Relevant memories (fused FTS5+BEAGLE):\n" + "\n".join(lines))
 
     def _with_notice(self, output: str) -> str:
-        """Prepend a pending user-facing notice (rebuild events) once, and
-        append a live progress bar if a full vector build is running."""
-        parts = []
-        if self._pending_notice:
-            parts.append(self._pending_notice)
-            self._pending_notice = None  # show once
-        if self._build_progress is not None:
-            done, total = self._build_progress
-            bar = _render_progress(done, total)
-            if bar:
-                parts.append(bar)
-        if parts:
-            prefix = "\n\n".join(parts)
-            if output:
-                return prefix + "\n\n" + output
-            return prefix
+        """NO-OP: prefetch output must stay pure memory context.
+
+        Build progress and rebuild notices are surfaced ONLY via the
+        on-demand `beaglemem_status` tool. Injecting status into prefetch
+        pollutes the model context on every turn during a build.
+        """
         return output
 
     def _prefetch_beagle_only(self, query: str) -> str:

@@ -43,14 +43,15 @@ def test_provider_is_available_no_deps():
     assert BeagleMemoryProvider().is_available() is True
 
 
-def test_provider_exposes_three_tools():
-    """Tool surface: beaglemem_add, beaglemem_search, beaglemem_feedback.
-    beaglemem_probe dropped — fused search is always better than semantic-only."""
+def test_provider_exposes_tools():
+    """Tool surface: add, search, feedback, status.
+    beaglemem_probe dropped — fused search is always better than semantic-only.
+    beaglemem_status added — on-demand build/rebuild progress (no context pollution)."""
     from beaglemem import BeagleMemoryProvider
     p = BeagleMemoryProvider()
     schemas = p.get_tool_schemas()
     names = {s["name"] for s in schemas}
-    assert names == {"beaglemem_add", "beaglemem_search", "beaglemem_feedback"}
+    assert names == {"beaglemem_add", "beaglemem_search", "beaglemem_feedback", "beaglemem_status"}
 
 
 def test_handle_tool_call_returns_json_string():

@@ -18,18 +18,21 @@ def _make_provider(tmpdir):
     return p
 
 
-def test_notice_surfaced_once_in_prefetch(tmpdir):
-    """A pending rebuild notice is prepended to prefetch output exactly once."""
+def test_notice_surfaced_only_via_status_tool(tmpdir):
+    """A pending rebuild notice is NOT injected into prefetch; it is exposed
+    only through the on-demand status tool."""
     p = _make_provider(tmpdir)
     p._pending_notice = "⚠️ test rebuild notice"
 
+    # prefetch stays pure (no pollution)
     out1 = p.prefetch("something that matches nothing")
-    assert "test rebuild notice" in out1
-    # cleared after first surfacing
-    assert p._pending_notice is None
+    assert "test rebuild notice" not in out1
 
-    out2 = p.prefetch("still nothing")
-    assert "test rebuild notice" not in out2
+    # status tool surfaces it
+    out2 = p.handle_tool_call("beaglemem_status", {})
+    assert "test rebuild notice" in out2
+    # notice is cleared after being reported once
+    assert p._pending_notice is None
 
 
 def test_notice_not_shown_without_notice(tmpdir):
