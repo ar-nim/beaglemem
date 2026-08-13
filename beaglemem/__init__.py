@@ -647,26 +647,12 @@ class BeagleMemoryProvider(MemoryProvider):
 
     def sync_turn(self, user_content: str, assistant_content: str, *,
                   session_id: str = "", messages=None) -> None:
-        """Append turn to compounding corpus archive. MUST be non-blocking."""
-        if not self._initialized or not self._data_dir:
-            return
-
-        def _sync():
-            try:
-                archive = os.path.join(self._data_dir, "corpus_archive.txt")
-                with open(archive, "a", encoding="utf-8") as fh:
-                    # Line-length cap: kill pasted code/logs/stack traces
-                    for src in (user_content, assistant_content):
-                        for line in src.strip().split("\n"):
-                            if len(line.strip()) <= 1000:
-                                fh.write(line.strip() + "\n")
-            except Exception:
-                pass  # best-effort, never breaks the turn
-
-        if self._sync_thread and self._sync_thread.is_alive():
-            self._sync_thread.join(timeout=5.0)
-        self._sync_thread = threading.Thread(target=_sync, daemon=True)
-        self._sync_thread.start()
+        """No-op. state.db is the canonical source of every turn (Hermes core
+        persists it per-turn). on_session_end reads new turns from state.db by
+        id watermark. The old corpus_archive.txt mirror is removed — it was a
+        redundant second copy whose damage could produce a stub model (2026-08-13).
+        """
+        return
 
     def on_memory_write(self, action: str, target: str, content: str,
                         metadata=None) -> None:

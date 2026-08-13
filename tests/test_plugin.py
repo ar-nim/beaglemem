@@ -153,3 +153,15 @@ def test_hermes_memory_manager_drives_provider():
 
     # shutdown
     mgr.shutdown_all()
+
+
+def test_sync_turn_is_noop_no_archive(tmp_path):
+    """sync_turn must NOT write corpus_archive.txt — state.db is the source."""
+    import time
+    from beaglemem import BeagleMemoryProvider
+    p = BeagleMemoryProvider()
+    p.initialize(session_id="test", hermes_home=str(tmp_path))
+    p.sync_turn("hello world message", "assistant reply here")
+    # give the (former) background thread a beat — should be a no-op now
+    time.sleep(0.05)
+    assert not os.path.exists(os.path.join(str(tmp_path), "beaglemem-data", "corpus_archive.txt"))
