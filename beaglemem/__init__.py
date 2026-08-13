@@ -97,7 +97,8 @@ class BeagleMemoryProvider(MemoryProvider):
         # tokenizer (e.g. v0.1 → v0.2 upgrade). Its vectors are stale and must
         # be rebuilt from the raw corpus archive.
         from .fingerprint import tokenizer_fingerprint
-        _TOKENIZER_REGEX = r"[^\W_][^\W_'\-=]*"  # v0.2 Unicode word regex
+        from .corpus import WORD_RE
+        _TOKENIZER_REGEX = WORD_RE.pattern  # single source of truth (v0.2)
         if self._model is not None:
             current_fp = tokenizer_fingerprint(
                 regex=_TOKENIZER_REGEX, stemmer=None,
