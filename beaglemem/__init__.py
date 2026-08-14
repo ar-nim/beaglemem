@@ -309,9 +309,6 @@ class BeagleMemoryProvider(MemoryProvider):
             #     (DROP/recreate renumbered ids from 1) → stale, rebuild
             elif last_seen and current_max > 0 and current_max * 10 < last_seen:
                 structural_ok = False
-            # (d) vocab stub: <100 words against a huge corpus
-            elif len(vocab_words) < 100 and current_max > 10000:
-                structural_ok = False
 
         if mem is None or not vocab_words:
             # cold start (nothing persisted yet)

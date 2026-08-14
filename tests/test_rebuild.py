@@ -395,3 +395,18 @@ def test_watermark_reset_detected(tmp_path):
     assert p._model is None
     assert p._force_rebuild is True
     assert p._pending_notice is not None
+
+
+def test_small_vocab_healthy_watermark_not_flagged(tmp_path):
+    """A canonical-source model with a healthy watermark (ingested the full
+    corpus) but a small vocab is LEGITIMATE — e.g. a pruned corpus whose
+    rebuild yielded few words. It must KEEP SERVING. The old (d) check
+    (`vocab < 100 and max > 10000`) false-flagged this as a stub, causing a
+    prune→rebuild→flag→rebuild loop. (a)+(b)+(c) already cover the real
+    failure modes; (d) is redundant and prune-hostile."""
+    _make_watermark_state(tmp_path, n_msgs=15000, last_seen_id=15000)
+    p = BeagleMemoryProvider()
+    p.initialize(session_id="test", hermes_home=str(tmp_path))
+    assert p._model is not None            # KEEP SERVING
+    assert p._force_rebuild is False
+    assert p._pending_notice is None

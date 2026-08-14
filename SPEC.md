@@ -72,10 +72,16 @@
   rebuild scheduled, notice via `_pending_notice`) when:
   (a) built from a non-canonical source (`corpus_source != state_db`);
   (b) the watermark covers <10% of the corpus id extent (stub — ingested
-  a sliver);
+  a sliver); or
   (c) the corpus id space shrank 10× since the build (reset — DROP/
-  recreate renumbered ids from 1); or
-  (d) <100 words against a >10K-id corpus (vocab stub).
+  recreate renumbered ids from 1).
+- A small vocab against a big id-extent is NOT a failure mode. `MAX(id)`
+  is a high-water mark, not a live-row count: after Hermes pruning a
+  corpus can have a huge id-extent but few live messages, and a full-ingest
+  model rebuilt over those few messages legitimately yields few words.
+  Flagging it (the old `vocab < 100 and max > 10000` check) causes a
+  prune→rebuild→flag→rebuild loop. (a)+(b)+(c) already cover every real
+  failure mode, so the vocab-stub check is gone.
 - WHY `MAX(id)` NOT `COUNT(*)`: `COUNT(*)` is a full scan over the content
   column AND collapses under Hermes session pruning (`DELETE FROM messages`
   in `prune_sessions`), which disables the `>100 messages` gate exactly when
