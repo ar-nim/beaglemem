@@ -65,11 +65,25 @@
 - STUB GUARD: `on_session_end()` returns immediately when `_model is None`
   — it never builds a fresh model from a partial tail. Model creation is
   owned by the full auto-build path.
-- STUB DETECTION: the model meta persists `consumed_sentences` +
-  `corpus_source`. On load, a model that (a) was built from a non-canonical
-  source, (b) consumed <10% of the corpus's messages, or (c) has <100
-  words against >10K messages is treated as damaged: cleared, a rebuild
-  scheduled, and a user-visible notice set via `_pending_notice`.
+- STUB DETECTION (watermark-based, v0.4): the model meta persists
+  `last_seen_id` (ingest watermark) + `corpus_source`. On load, `MAX(id)`
+  from state.db — the AUTOINCREMENT high-water mark — is compared against
+  the watermark, NOT a `COUNT(*)`. A model is treated as damaged (cleared,
+  rebuild scheduled, notice via `_pending_notice`) when:
+  (a) built from a non-canonical source (`corpus_source != state_db`);
+  (b) the watermark covers <10% of the corpus id extent (stub — ingested
+  a sliver);
+  (c) the corpus id space shrank 10× since the build (reset — DROP/
+  recreate renumbered ids from 1); or
+  (d) <100 words against a >10K-id corpus (vocab stub).
+- WHY `MAX(id)` NOT `COUNT(*)`: `COUNT(*)` is a full scan over the content
+  column AND collapses under Hermes session pruning (`DELETE FROM messages`
+  in `prune_sessions`), which disables the `>100 messages` gate exactly when
+  a stub is most dangerous. `MAX(id)` survives DELETE (AUTOINCREMENT never
+  reuses ids — `sqlite_sequence` persists through `VACUUM`), and
+  `last_seen_id` lives in beaglemem.db outside Hermes' prune radius, so both
+  sides of the comparison are pruning-immune. Reset (id collapse) is a
+  separate failure mode caught by the bidirectional guard (c).
 
 ## Migration contract (from holographic)
 - beaglemem's CLI (register_cli in cli.py) is only visible when beaglemem is

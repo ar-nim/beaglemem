@@ -300,3 +300,98 @@ def test_dim_change_hard_rebuild(tmp_path):
     assert p._model is None
     assert p._force_rebuild is True
     assert p._pending_notice is not None
+
+
+# --- Phase 8 (v0.4): watermark-based stub/reset detection ---
+#
+# The stub check used COUNT(*) on state.db — a full scan over the content
+# column. Hermes session pruning (DELETE FROM messages) collapses COUNT, and
+# with it the `_msg_count > 100` gate that arms the check. MAX(id) is the
+# AUTOINCREMENT high-water mark: it survives DELETE, so it is pruning-immune.
+# last_seen_id (the ingest watermark) lives in beaglemem.db, outside Hermes'
+# prune radius — so comparing last_seen_id against MAX(id) detects stubs and
+# corpus resets without a slow COUNT(*).
+
+def _make_watermark_state(tmp_path, n_msgs=150, last_seen_id=None,
+                          dim=64, window=2):
+    """A valid v0.3 state where the model watermark (last_seen_id) can differ
+    from the corpus MAX(id), to exercise stub/reset detection. Corpus uses
+    AUTOINCREMENT so MAX(id) survives DELETE (the prune case)."""
+    from beaglemem.fingerprint import ENCODER_VERSION, tokenizer_fingerprint
+    from beaglemem.corpus import WORD_RE
+    from beaglemem.store import BeagleStore
+    data_dir = tmp_path / "beaglemem-data"
+    data_dir.mkdir()
+    _make_big_corpus(str(tmp_path / "state.db"), n=n_msgs)
+
+    n_words = 5
+    mem = np.random.RandomState(0).randn(n_words, dim).astype(np.float32)
+    np.save(str(data_dir / "beagle_mem.npy"), mem)
+    fv = np.random.RandomState(1).randn(2, dim).astype(np.float32)
+    np.save(str(data_dir / "fact_vectors.npy"), fv)
+
+    store = BeagleStore(str(data_dir / "beaglemem.db"), create=True)
+    for i in range(2):
+        store.add(f"fact content number {i} with enough words here")
+    current_fp = tokenizer_fingerprint(regex=WORD_RE.pattern, stemmer=None,
+                                       dim=dim, window=window)
+    if last_seen_id is None:
+        last_seen_id = n_msgs  # healthy: watermark == corpus extent
+    store.persist_model(
+        ["word_a", "word_b", "word_c", "word_d", "word_e"],
+        {"word_a": 5, "word_b": 3, "word_c": 2, "word_d": 2, "word_e": 2},
+        {
+            "dim": dim, "window": window, "min_count": 2,
+            "tokenizer_fingerprint": current_fp,
+            "regex": WORD_RE.pattern, "stemmer": None,
+            "consumed_sentences": 100, "corpus_source": "state_db",
+            "last_seen_id": last_seen_id,
+            "encoder_version": ENCODER_VERSION,
+        },
+    )
+    store.close()
+    (tmp_path / "config.yaml").write_text(
+        f"plugins:\n  beaglemem:\n    dim: {dim}\n    window: {window}\n"
+    )
+    return str(data_dir)
+
+
+def test_watermark_stub_detected(tmp_path):
+    """A model whose watermark (last_seen_id) covers <10% of the corpus id
+    extent is a stub — cleared + rebuild notice, detected via MAX(id)."""
+    _make_watermark_state(tmp_path, n_msgs=150, last_seen_id=5)
+    p = BeagleMemoryProvider()
+    p.initialize(session_id="test", hermes_home=str(tmp_path))
+    assert p._model is None
+    assert p._force_rebuild is True
+    assert p._pending_notice is not None
+
+
+def test_watermark_prune_does_not_flag(tmp_path):
+    """Pruning old (low-id) messages must NOT flag a healthy model as a stub.
+    MAX(id) survives DELETE (AUTOINCREMENT), so a model built over the full
+    corpus (last_seen == MAX(id)) keeps serving even after pruning leaves few
+    live rows — the COUNT(*)-based check would false-negative here."""
+    _make_watermark_state(tmp_path, n_msgs=150, last_seen_id=150)
+    # prune: delete the 140 oldest messages, leaving 10 live rows
+    conn = sqlite3.connect(str(tmp_path / "state.db"))
+    conn.execute("DELETE FROM messages WHERE id <= 140")
+    conn.commit()
+    conn.close()
+    p = BeagleMemoryProvider()
+    p.initialize(session_id="test", hermes_home=str(tmp_path))
+    assert p._model is not None            # KEEP SERVING
+    assert p._force_rebuild is False
+    assert p._pending_notice is None
+
+
+def test_watermark_reset_detected(tmp_path):
+    """A corpus whose id space collapsed below the model watermark (DROP/
+    recreate renumbered ids) is detected via the bidirectional guard — the
+    corpus shrank 10× since the build, so the model is stale and rebuilds."""
+    _make_watermark_state(tmp_path, n_msgs=5, last_seen_id=500)
+    p = BeagleMemoryProvider()
+    p.initialize(session_id="test", hermes_home=str(tmp_path))
+    assert p._model is None
+    assert p._force_rebuild is True
+    assert p._pending_notice is not None

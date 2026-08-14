@@ -281,25 +281,36 @@ class BeagleMemoryProvider(MemoryProvider):
             and stored_dim == self._config_dim  # config takes top priority
         )
 
-        # stub detection (history-depth guard, v0.2 behavior preserved)
+        # stub detection (history-depth guard): watermark-based (v0.4).
+        #
+        # Replaces the COUNT(*) check. COUNT(*) is a full scan over the
+        # content column AND collapses under Hermes session pruning
+        # (DELETE FROM messages), which disables the `_msg_count > 100` gate
+        # exactly when a stub is most dangerous. MAX(id) is the AUTOINCREMENT
+        # high-water mark — it survives DELETE, so it is pruning-immune.
+        # last_seen_id (the ingest watermark) lives in beaglemem.db, outside
+        # Hermes' prune radius. Comparing the two detects stubs and corpus
+        # resets in ~2ms (PK-indexed) instead of a ~1s cold full scan.
         if structural_ok and self._store is not None:
+            from .adapters.state_db import max_message_id
             try:
-                import sqlite3 as _sq
-                _conn = _sq.connect(f"file:{self._corpus_db}?mode=ro", uri=True)
-                _msg_count = _conn.execute(
-                    "SELECT COUNT(*) FROM messages WHERE role IN ('user','assistant') "
-                    "AND content IS NOT NULL AND content != ''"
-                ).fetchone()[0]
-                _conn.close()
+                current_max = max_message_id(self._corpus_db)
             except Exception:
-                _msg_count = 0
+                current_max = 0
             src = meta.get("corpus_source")
-            consumed = int(meta.get("consumed_sentences", 0) or 0)
-            if src is not None and src != "state_db" and _msg_count > 100:
+            last_seen = int(meta.get("last_seen_id", 0) or 0)
+            # (a) non-canonical source against a substantial corpus → damaged
+            if src is not None and src != "state_db" and current_max > 100:
                 structural_ok = False
-            elif consumed and _msg_count > 100 and consumed < _msg_count * 0.1:
+            # (b) stub: watermark covers <10% of the corpus id extent
+            elif last_seen and current_max > 100 and last_seen < current_max * 0.1:
                 structural_ok = False
-            elif len(vocab_words) < 100 and _msg_count > 10000:
+            # (c) reset: corpus id space shrank 10× since the build
+            #     (DROP/recreate renumbered ids from 1) → stale, rebuild
+            elif last_seen and current_max > 0 and current_max * 10 < last_seen:
+                structural_ok = False
+            # (d) vocab stub: <100 words against a huge corpus
+            elif len(vocab_words) < 100 and current_max > 10000:
                 structural_ok = False
 
         if mem is None or not vocab_words:
