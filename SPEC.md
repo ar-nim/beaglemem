@@ -1,4 +1,4 @@
-# SPEC — beagle v0.1
+# SPEC — beagle v0.1.0
 
 ## Corpus contract
 - Adapters yield tokenized sentences: list[str], lowercase, [a-z0-9][a-z0-9'-]*
