@@ -17,9 +17,14 @@ from beaglemem.vectors import BeagleModel
 
 
 def _make_legacy_model(data_dir: str, dim: int = 64, window: int = 2) -> None:
-    """Build + save a model with a NON-matching fingerprint (simulates v0.1)."""
+    """Build + save a model with a NON-matching fingerprint (simulates v0.1).
+
+    min_count=1 (not 2): with a single sentence of 3 unique words, min_count=2
+    never allocates any vocab — the "legacy model" would be EMPTY and the test
+    would silently fall into the cold-start path instead of exercising the
+    invalid-model → forced-rebuild path it claims to test."""
     os.makedirs(data_dir, exist_ok=True)
-    model = BeagleModel(dim=dim, window=window, min_count=2)
+    model = BeagleModel(dim=dim, window=window, min_count=1)
     model.add_sentence(["hello", "world", "test"])
     model.tokenizer_fingerprint = "LEGACY-00000000000000"
     model.save(data_dir)
@@ -410,3 +415,32 @@ def test_small_vocab_healthy_watermark_not_flagged(tmp_path):
     assert p._model is not None            # KEEP SERVING
     assert p._force_rebuild is False
     assert p._pending_notice is None
+
+
+# --- Phase 9 (v0.4): build gate uses MAX(id), not COUNT(*) ---
+#
+# The auto-build gate asked "does the corpus have >100 messages?" via a
+# COUNT(*) full scan (~1s cold on a big state.db). MAX(id) is the
+# AUTOINCREMENT high-water mark (~2ms, PK-indexed) and pruning-immune.
+# This also fixes the latent bug where cold start set _force_rebuild=True,
+# which shadowed the size gate and made every fresh install auto-build
+# even on a tiny corpus — violating the SPEC cold-start contract (>100
+# messages). Cold start is OPPORTUNISTIC, not forced: the size gate applies.
+
+def test_fresh_install_tiny_corpus_no_auto_build(tmp_path):
+    """A fresh install with a tiny corpus (<100 messages by MAX(id)) must NOT
+    auto-build — FTS5-only until the corpus grows. Cold start is OPPORTUNISTIC,
+    not forced: the corpus-size gate applies."""
+    _make_big_corpus(str(tmp_path / "state.db"), n=10)
+    p = BeagleMemoryProvider()
+    p.initialize(session_id="test", hermes_home=str(tmp_path))
+    assert p._initial_build_started is False
+
+
+def test_fresh_install_big_corpus_auto_builds(tmp_path):
+    """A fresh install with a substantial corpus (>100 messages) auto-builds
+    in the background."""
+    _make_big_corpus(str(tmp_path / "state.db"), n=150)
+    p = BeagleMemoryProvider()
+    p.initialize(session_id="test", hermes_home=str(tmp_path))
+    assert p._initial_build_started is True

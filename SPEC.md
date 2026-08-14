@@ -51,10 +51,18 @@
   `prefetch()` runs FTS5-only when `_model is None`. Same design intent
   as holographic (vector path is additive, never required).
 - AUTO-BUILD: on first activation, `initialize()` detects state.db with
-  >100 messages and kicks off `_initial_build()` in a daemon thread.
+  `MAX(id) > 100` and kicks off `_initial_build()` in a daemon thread.
   User chats normally (FTS5-only) while vectors build in background
   (~30-60s). Next session: model loads, full FTS5+BEAGLE active.
   No manual `hermes beaglemem build` needed for the initial experience.
+- The build gate uses `MAX(id)` — the AUTOINCREMENT high-water mark
+  (~2ms, PK-indexed, pruning-immune) — NOT `COUNT(*)` (a ~1s cold full
+  scan that also collapses under Hermes pruning and would false-negative
+  the `>100` gate).
+- Cold start is OPPORTUNISTIC, not forced: a fresh install does NOT set
+  `_force_rebuild`; the corpus-size gate decides. Only a forced rebuild
+  (structural damage, fingerprint/config change, stub, reset) sets
+  `_force_rebuild=True`, which rebuilds even on a tiny corpus.
 - `hermes beaglemem build` is for REBUILDS only (algorithm change,
   filter update, adding a custom corpus).
 - `sync_turn()` is a no-op — state.db is the canonical source of every

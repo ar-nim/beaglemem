@@ -129,17 +129,15 @@ class BeagleMemoryProvider(MemoryProvider):
         if (self._model is None or getattr(self, "_stale_rebuild", False)) \
                 and not self._initial_build_started:
             try:
-                import sqlite3 as _sq
-                test_conn = _sq.connect(f"file:{corpus_db}?mode=ro", uri=True)
-                msg_count = test_conn.execute(
-                    "SELECT COUNT(*) FROM messages WHERE role IN ('user','assistant') "
-                    "AND content IS NOT NULL AND content != ''"
-                ).fetchone()[0]
-                test_conn.close()
-                # A forced rebuild (structural damage, config change, stale) is
-                # MANDATORY — it must rebuild even on a small corpus. Only the
-                # OPPORTUNISTIC first-run auto-build is gated by msg_count > 100.
-                if getattr(self, "_force_rebuild", False) or msg_count > 100:
+                from .adapters.state_db import max_message_id
+                # A forced rebuild (structural damage, config change, stale,
+                # reset) is MANDATORY — it must rebuild even on a small corpus.
+                # Only the OPPORTUNISTIC first-run auto-build is gated by
+                # corpus size. MAX(id) is the AUTOINCREMENT high-water mark
+                # (~2ms, PK-indexed) and pruning-immune — NOT COUNT(*), which
+                # is a ~1s cold full scan AND collapses under Hermes pruning.
+                corpus_max = max_message_id(corpus_db)
+                if getattr(self, "_force_rebuild", False) or corpus_max > 100:
                     self._initial_build_started = True
                     t = threading.Thread(
                         target=self._initial_build,
@@ -311,9 +309,12 @@ class BeagleMemoryProvider(MemoryProvider):
                 structural_ok = False
 
         if mem is None or not vocab_words:
-            # cold start (nothing persisted yet)
+            # cold start (nothing persisted yet) — OPPORTUNISTIC, not forced.
+            # _force_rebuild stays False so the auto-build gate applies its
+            # corpus-size check (max_message_id() > 100). Setting _force_rebuild
+            # here would shadow that gate and auto-build on a tiny fresh
+            # corpus — violating the SPEC cold-start contract.
             self._model = None
-            self._force_rebuild = True
         elif not structural_ok:
             # structurally broken → hard rebuild (non-destructive)
             self._model = None
